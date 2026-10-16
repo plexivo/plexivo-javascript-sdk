@@ -16,7 +16,7 @@
     }
   },
   "bin": {
-    "plexivo-generate-types": "./scripts/generate-types.mjs"
+    "plexivo-generate-types": "scripts/generate-types.mjs"
   },
   "scripts": {
     "test": "node --test",
