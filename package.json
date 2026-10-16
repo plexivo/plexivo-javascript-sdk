@@ -1,7 +1,7 @@
 {
   "name": "@plexivo/client",
-  "version": "0.1.1",
-  "description": "Plexivo Client Data SDK for JavaScript, TypeScript, React, React Native, and Vue",
+  "version": "0.2.0",
+  "description": "Plexivo Postgres client for JavaScript and TypeScript: queries (Supabase-style and GORM-style), models and relations, transactions, migrations, auth, realtime, GraphQL, functions and storage",
   "type": "module",
   "main": "./src/index.js",
   "types": "./index.d.ts",
@@ -41,9 +41,18 @@
   "keywords": [
     "plexivo",
     "postgres",
+    "postgresql",
+    "orm",
+    "gorm",
+    "query-builder",
     "database",
     "realtime",
     "auth",
-    "client"
+    "graphql",
+    "migrations",
+    "supabase-alternative",
+    "react",
+    "react-native",
+    "vue"
   ]
 }

@@ -68,7 +68,7 @@ test('persists sessions, refreshes an expired access token once, and emits auth 
     if (url.endsWith('/auth/refresh')) {
       return new Response(JSON.stringify({access_token: 'fresh', refresh_token: 'rotated'}), {status: 200});
     }
-    if (url.endsWith('/rest/v1/items')) {
+    if (url.endsWith('/query/v1')) {
       itemCalls += 1;
       if (itemCalls === 1) {
         return new Response(JSON.stringify({error: {code: 'token_expired'}}), {status: 401});
@@ -121,7 +121,7 @@ test('coalesces concurrent expired-token retries into one refresh rotation', asy
       await new Promise((resolve) => setTimeout(resolve, 5));
       return new Response(JSON.stringify({access_token: 'fresh', refresh_token: 'rotated'}), {status: 200});
     }
-    if (url.endsWith('/rest/v1/items')) {
+    if (url.endsWith('/query/v1')) {
       if (init.headers.get('authorization') === 'Bearer expired') {
         expiredCalls += 1;
         return new Response(JSON.stringify({error: {code: 'token_expired'}}), {status: 401});

@@ -12,15 +12,14 @@ export const plexivo = createClient<Database>(
 )
 ```
 
-Generate the versioned starter schema without a database password or server key:
+Generate types from your project's live API (no password or server key needed):
 
-```sh
-npx plexivo-generate-types --url "$PLEXIVO_DATA_URL" --key "$PLEXIVO_PUBLISHABLE_KEY" --output src/database.types.ts
+```js
+import { renderApiTypes } from '@plexivo/client/generate-types'
+writeFileSync('src/database.types.ts', renderApiTypes(await plexivo.getApi()))
 ```
 
-The generated definition covers only tables present in the public Client Data schema contract. It does not reflect arbitrary PostgreSQL schemas.
-
-React and React Native can keep the client in a context provider. Vue can expose the same singleton through a plugin. Authentication, RLS-backed CRUD, token refresh, and realtime subscriptions use the same SDK in every framework.
+React and React Native can keep the client in a context provider. Vue can expose the same singleton through a plugin. Authentication, queries and models, transactions, token refresh, realtime and GraphQL use the same SDK in every framework.
 
 Browser sessions are persisted by default and an expired access token is refreshed once before the original request is retried. React Native must pass an encrypted device-storage adapter rather than using unencrypted application preferences.
 
@@ -37,15 +36,11 @@ await plexivo.auth.signOut() // revokes the current refresh session on the serve
 subscription.unsubscribe()
 ```
 
-The verified staging surface is deliberately narrower than Supabase: email/password, password changes, server-side logout, self-service account disablement, TOTP MFA, the RLS-protected `items` API, and API-mutation events. A private Storage SDK is source-tested but remains disabled until its dedicated bucket credential and hostile staging tests pass:
+Files go straight to storage with a short-lived signed URL; the browser never receives a database password or storage credential:
 
 ```js
-const object = await plexivo.storage.upload(
-  'avatars/me.png',
-  file,
-  {contentType: 'image/png'}
-);
-const downloaded = await plexivo.storage.download(object.id);
+const object = await plexivo.storage.upload('avatars/me.png', file, {contentType: 'image/png'})
+const downloaded = await plexivo.storage.download(object.id)
 ```
 
-Upload bytes receive only a short-lived, operation-bound signed URL; the browser never receives the project key, app-user JWT, database password or MinIO credential on that request. Password recovery delivery, social OAuth, arbitrary schemas, advanced Storage, Functions and WAL change capture remain unavailable until their own acceptance gates pass.
+See the [README](../README.md) for queries, models, transactions, realtime, GraphQL, functions and the server-only SQL and migrations.
