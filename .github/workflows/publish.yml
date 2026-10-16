@@ -1,0 +1,75 @@
+name: Validate and publish npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm install --global npm@11.19.0
+      - name: Validate package and release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          import assert from 'node:assert/strict';
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          assert.equal(pkg.name, '@plexivo/client');
+          assert.equal(pkg.repository.url, 'git+https://github.com/plexivo/plexivo-javascript-sdk.git');
+          if (process.env.GITHUB_EVENT_NAME === 'release') {
+            assert.match(pkg.version, /^\d+\.\d+\.\d+$/, 'Only stable releases are supported');
+            assert.equal(process.env.RELEASE_TAG, `v${pkg.version}`, 'Release tag must match package.json');
+            assert.equal(process.env.RELEASE_PRERELEASE, 'false', 'Prereleases are not published to latest');
+          }
+          NODE
+          git merge-base --is-ancestor HEAD origin/main
+      - run: npm test
+      - run: npm pack --dry-run --ignore-scripts
+      - name: Record validated commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  publish:
+    if: github.event_name == 'release'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm install --global npm@11.19.0
+      - name: Publish through npm Trusted Publishing
+        run: npm publish --access public --provenance --ignore-scripts
