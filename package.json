@@ -1,6 +1,6 @@
 {
   "name": "@plexivo/client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Plexivo Client Data SDK for JavaScript, TypeScript, React, React Native, and Vue",
   "type": "module",
   "main": "./src/index.js",
