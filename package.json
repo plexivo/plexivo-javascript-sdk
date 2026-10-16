@@ -1,0 +1,49 @@
+{
+  "name": "@plexivo/client",
+  "version": "0.1.0",
+  "description": "Plexivo Client Data SDK for JavaScript, TypeScript, React, React Native, and Vue",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./src/index.js"
+    },
+    "./generate-types": {
+      "types": "./generate-types.d.ts",
+      "import": "./src/generate-types.js"
+    }
+  },
+  "bin": {
+    "plexivo-generate-types": "./scripts/generate-types.mjs"
+  },
+  "scripts": {
+    "test": "node --test",
+    "pack:check": "npm pack --dry-run"
+  },
+  "files": [
+    "index.d.ts",
+    "generate-types.d.ts",
+    "src",
+    "scripts"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://plexivo.io/postgres/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/plexivo/plexivo-javascript-sdk.git"
+  },
+  "bugs": "https://github.com/plexivo/plexivo-javascript-sdk/issues",
+  "keywords": [
+    "plexivo",
+    "postgres",
+    "database",
+    "realtime",
+    "auth",
+    "client"
+  ]
+}
