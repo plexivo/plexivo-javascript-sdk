@@ -19,6 +19,7 @@
     "plexivo-generate-types": "scripts/generate-types.mjs"
   },
   "scripts": {
+    "check": "node scripts/check-syntax.mjs",
     "test": "node --test",
     "pack:check": "npm pack --dry-run"
   },
@@ -26,7 +27,8 @@
     "index.d.ts",
     "generate-types.d.ts",
     "src",
-    "scripts"
+    "scripts/generate-types.mjs",
+    "SECURITY.md"
   ],
   "engines": {
     "node": ">=20"
