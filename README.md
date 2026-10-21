@@ -34,7 +34,7 @@ Your data URL and publishable key are on the database's **Connect** tab. The pub
 
 1. Create Plexivo Postgres in the console and enable its Data API on **Connect**.
 2. Allow your exact web origin in the Data API settings. Copy the project URL and **publishable** key. Never use the server secret key in a browser.
-3. Run this once through the database SQL console with write mode and confirmation:
+3. Connect as the database owner using `plexivo db connect YOUR_DATABASE` and a PostgreSQL client such as `psql`. Keep credentials out of shell history. Run the following setup through that connection; the web SQL console intentionally does not accept policy or privilege-management statements:
 
 ```sql
 CREATE TABLE public.quickstart_notes (
@@ -50,7 +50,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON public.quickstart_notes TO authenticated
 GRANT USAGE ON SEQUENCE public.quickstart_notes_id_seq TO authenticated;
 ```
 
-The SQL console accepts one statement per execution. Enable `quickstart_notes` in the project's Data API table settings after creating it. The policy restricts each signed-in user to their own rows.
+Refresh the project's Data API schema and confirm `quickstart_notes` appears as exposed. A table needs row-level security and a policy to be exposed. The policy above restricts each signed-in user to their own rows. Close the administrative tunnel when setup is complete.
 
 ```js
 const db = createClient(projectUrl, publishableKey);
@@ -383,7 +383,8 @@ live.unsubscribe();
 
 ```js
 const { data } = await db.functions.invoke('send-receipt', { body: { orderId } });
-// Optional sub-route and query string, encoded without changing the project origin:
+// Source main (not npm 0.2.0): optional sub-route and query string,
+// encoded without changing the project origin:
 await db.functions.invoke('echo', { path: 'status/detail', query: { page: 2 } });
 ```
 
