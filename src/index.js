@@ -424,13 +424,21 @@ export function createClient(apiUrl, publishableKey, options = {}) {
 
   /** Plexivo Functions: your server-side code beside the data. */
   const functions = {
-    async invoke(name, {body, method = 'POST', headers = {}} = {}) {
+    async invoke(name, {body, method = 'POST', headers = {}, path = '', query = {}} = {}) {
+      if (name === '.' || name === '..') throw new TypeError('Invalid function name');
+      const segments = String(path).split('/').filter(Boolean);
+      if (segments.some((s) => s === '.' || s === '..')) throw new TypeError('Function path must not contain dot segments');
+      const suffix = segments.length ? '/' + segments.map(encodeURIComponent).join('/') : '';
+      const url = new URL(`${baseUrl}/functions/v1/${encodeURIComponent(name)}${suffix}`);
+      for (const [key, value] of Object.entries(query)) {
+        if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+      }
       const h = new Headers(headers);
       h.set('apikey', publishableKey);
       if (session?.access_token) h.set('authorization', `Bearer ${session.access_token}`);
       const isJson = body !== undefined && typeof body === 'object' && !(body instanceof ArrayBuffer) && !ArrayBuffer.isView(body) && !(typeof Blob !== 'undefined' && body instanceof Blob);
       if (isJson && !h.has('content-type')) h.set('content-type', 'application/json');
-      const response = await request(`${baseUrl}/functions/v1/${encodeURIComponent(name)}`, {method, headers: h, body: isJson ? JSON.stringify(body) : body});
+      const response = await request(url.toString(), {method, headers: h, body: isJson ? JSON.stringify(body) : body});
       lastTraceId = response.headers.get('x-trace-id');
       const type = response.headers.get('content-type') || '';
       const data = type.includes('application/json') ? await response.json() : await response.text();

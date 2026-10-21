@@ -494,7 +494,7 @@ export interface PlexivoClient<TDatabase extends DatabaseDefinition = DefaultDat
   transaction(callback: (tx: TransactionClient<TDatabase>) => unknown): Promise<any[]>;
   rpc<TName extends keyof Functions<TDatabase> & string>(fn: TName, args?: Record<string, unknown>): Promise<{ data: Functions<TDatabase>[TName] extends { Returns: infer R } ? R : unknown; count: number | null; error: null }>;
   graphql: GraphQLClient;
-  functions: { invoke<T = any>(name: string, options?: { body?: unknown; method?: string; headers?: Record<string, string> }): Promise<{ data: T; status: number; headers: Headers }> };
+  functions: { invoke<T = any>(name: string, options?: { body?: unknown; method?: string; headers?: Record<string, string>; path?: string; query?: Record<string, string | number | boolean | null | undefined> }): Promise<{ data: T; status: number; headers: Headers }> };
   channel<T = Record<string, unknown>>(topic?: string, options?: { filter?: string; presence?: Record<string, unknown> }): RealtimeChannel<T>;
   storage: ObjectStorageClient;
   getApi(): Promise<LiveApi>;

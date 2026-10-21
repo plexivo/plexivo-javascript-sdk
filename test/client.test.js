@@ -3,6 +3,24 @@ import assert from 'node:assert/strict';
 import {createClient} from '../src/index.js';
 import {renderTypes} from '../src/generate-types.js';
 
+test('function invocations preserve encoded paths and query values on the project origin', async () => {
+  const calls = [];
+  const client = createClient('https://api.example/client/v1/project', 'plx_publishable_test', {
+    fetch: async (url, init) => { calls.push({url, init}); return new Response('{"ok":true}', {headers: {'content-type': 'application/json'}}); }
+  });
+  await client.functions.invoke('echo', {path: '/some folder/part?x=1', query: {q: 'a & b', n: 2, flag: false, absent: null}, body: {hello: 'world'}});
+  const url = new URL(calls[0].url);
+  assert.equal(url.origin, 'https://api.example');
+  assert.equal(url.pathname, '/client/v1/project/functions/v1/echo/some%20folder/part%3Fx%3D1');
+  assert.equal(url.searchParams.get('q'), 'a & b');
+  assert.equal(url.searchParams.get('n'), '2');
+  assert.equal(url.searchParams.get('flag'), 'false');
+  assert.equal(url.searchParams.has('absent'), false);
+  assert.equal(calls[0].init.body, '{"hello":"world"}');
+  await assert.rejects(client.functions.invoke('echo', {path: '../other'}), TypeError);
+  assert.equal(calls.length, 1);
+});
+
 test('uses the publishable key and app-user access token', async () => {
   const calls = [];
   const fetch = async (url, init) => {

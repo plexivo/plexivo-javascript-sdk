@@ -30,6 +30,38 @@ Your data URL and publishable key are on the database's **Connect** tab. The pub
 
 ---
 
+## First working app
+
+1. Create Plexivo Postgres in the console and enable its Data API on **Connect**.
+2. Allow your exact web origin in the Data API settings. Copy the project URL and **publishable** key. Never use the server secret key in a browser.
+3. Run this once through the database SQL console with write mode and confirmation:
+
+```sql
+CREATE TABLE public.quickstart_notes (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id uuid NOT NULL DEFAULT auth.uid(),
+  body text NOT NULL
+);
+ALTER TABLE public.quickstart_notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_notes ON public.quickstart_notes TO authenticated
+  USING (owner_id = auth.uid()) WITH CHECK (owner_id = auth.uid());
+GRANT USAGE ON SCHEMA public TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.quickstart_notes TO authenticated;
+GRANT USAGE ON SEQUENCE public.quickstart_notes_id_seq TO authenticated;
+```
+
+The SQL console accepts one statement per execution. Enable `quickstart_notes` in the project's Data API table settings after creating it. The policy restricts each signed-in user to their own rows.
+
+```js
+const db = createClient(projectUrl, publishableKey);
+await db.auth.signUp({ email, password }); // or signInWithPassword for an existing user
+await db.from('quickstart_notes').insert({ body: 'Hello from Plexivo' });
+const notes = await db.from('quickstart_notes').select('id, body');
+console.log(notes);
+```
+
+Check email-verification requirements in your project's Auth settings. If a request returns `429`, respect its `Retry-After` header; repeated immediate retries do not increase the project's allowance. Apps, direct database connections and Cache can run independently of the control plane; Data API, Auth, Realtime and Functions depend on it.
+
 ## Contents
 
 - [Queries](#queries)
@@ -351,6 +383,8 @@ live.unsubscribe();
 
 ```js
 const { data } = await db.functions.invoke('send-receipt', { body: { orderId } });
+// Optional sub-route and query string, encoded without changing the project origin:
+await db.functions.invoke('echo', { path: 'status/detail', query: { page: 2 } });
 ```
 
 ## Files
