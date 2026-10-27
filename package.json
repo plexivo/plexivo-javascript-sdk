@@ -1,7 +1,7 @@
 {
   "name": "@plexivo/client",
-  "version": "0.2.0",
-  "description": "Plexivo Postgres client for JavaScript and TypeScript: queries (Supabase-style and GORM-style), models and relations, transactions, migrations, auth, realtime, GraphQL, functions and storage",
+  "version": "0.3.0",
+  "description": "Plexivo Postgres for JavaScript and TypeScript: a Backend-as-a-Service and Firebase alternative on PostgreSQL. Auth, Data API queries, realtime, GraphQL live queries, Plexivo Functions and file storage.",
   "type": "module",
   "main": "./src/index.js",
   "types": "./index.d.ts",
@@ -28,13 +28,18 @@
     "index.d.ts",
     "generate-types.d.ts",
     "src",
-    "scripts"
+    "scripts",
+    "examples",
+    "!examples/browser/node_modules",
+    "!examples/browser/dist",
+    "!examples/**/.env",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=20"
   },
   "license": "Apache-2.0",
-  "homepage": "https://plexivo.io/postgres/",
+  "homepage": "https://plexivo.io/docs/#docs-postgres",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/plexivo/plexivo-javascript-sdk.git"
@@ -42,17 +47,23 @@
   "bugs": "https://github.com/plexivo/plexivo-javascript-sdk/issues",
   "keywords": [
     "plexivo",
+    "backend-as-a-service",
+    "baas",
+    "firebase alternative",
+    "firebase-alternative",
+    "supabase-alternative",
     "postgres",
     "postgresql",
-    "orm",
-    "gorm",
-    "query-builder",
-    "database",
     "realtime",
     "auth",
+    "authentication",
     "graphql",
-    "migrations",
-    "supabase-alternative",
+    "live-queries",
+    "serverless-functions",
+    "database",
+    "orm",
+    "query-builder",
+    "row-level-security",
     "react",
     "react-native",
     "vue"

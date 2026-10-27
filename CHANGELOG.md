@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0
+
+Plexivo Postgres as a Backend-as-a-Service, documented end to end.
+
+- **Documentation**: a new README (quick start in five minutes, auth, data,
+  realtime, GraphQL and live queries, Plexivo Functions, files, errors,
+  TypeScript, security, coming from Firebase) and TSDoc on every exported
+  symbol, with a typedoc API reference (`npm run docs`).
+- **Examples** in the package: Node examples for auth, a todo list, a
+  realtime chat, a GraphQL live query and a function call; a Vite browser
+  app; the SQL schema and the function they use. Type-checked, and run
+  against a live Plexivo Postgres before release.
+- **Functions**: `functions.invoke(name, {path, query})` calls a sub-route
+  with a query string.
+- **Fixes**: every failure is now a `PlexivoError` — non-JSON error bodies,
+  signed storage transfers, several rows for `single()`/`sole()`, and calls
+  that need a user (`sign_in_required`). `signOut()` while signed out
+  resolves. A refused realtime join rejects `ready()` and reaches
+  `graphql.subscribe`. `plexivo-generate-types` reads the live Data API
+  instead of the old starter table.
+- Type declarations: `PlexivoError` and `RecordNotFoundError` constructors;
+  `create(…, {returning: 'minimal'})` resolves to a count.
+
 ## 0.2.0
 
 Everything Plexivo Postgres offers, from one client.

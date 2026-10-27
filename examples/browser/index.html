@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Plexivo Postgres in the browser</title>
+    <style>
+      :root { font-family: system-ui, -apple-system, sans-serif; color-scheme: light dark; }
+      body { max-width: 40rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+      section { border: 1px solid #8884; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; }
+      h1 { font-size: 1.5rem; } h2 { font-size: 1.1rem; margin-top: 0; }
+      form { display: flex; gap: .5rem; flex-wrap: wrap; }
+      input[type=text], input[type=email], input[type=password] { flex: 1; min-width: 10rem; padding: .4rem .6rem; }
+      ul { padding-left: 1.2rem; } .muted { opacity: .7; } .error { color: #d33; }
+      [hidden] { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <h1>Plexivo Postgres</h1>
+    <p class="muted" id="status">Signed out</p>
+    <p class="error" id="error" hidden></p>
+
+    <section id="auth">
+      <h2>Sign in</h2>
+      <form id="sign-in">
+        <input type="email" name="email" placeholder="you@example.com" required autocomplete="email" />
+        <input type="password" name="password" placeholder="Password (10+ characters)" required minlength="10" autocomplete="current-password" />
+        <button name="mode" value="in">Sign in</button>
+        <button name="mode" value="up">Create account</button>
+      </form>
+    </section>
+
+    <div id="app" hidden>
+      <section>
+        <h2>Todos <small class="muted" id="live-count"></small></h2>
+        <form id="add-todo">
+          <input type="text" name="title" placeholder="What needs doing?" required maxlength="200" />
+          <button>Add</button>
+        </form>
+        <ul id="todos"></ul>
+      </section>
+
+      <section>
+        <h2>Chat <small class="muted" id="typing"></small></h2>
+        <ul id="messages"></ul>
+        <form id="send">
+          <input type="text" name="body" placeholder="Say hello" required maxlength="2000" autocomplete="off" />
+          <button>Send</button>
+        </form>
+      </section>
+
+      <section>
+        <h2>Plexivo Functions</h2>
+        <button id="call-hello">Call hello</button> <span id="hello-result" class="muted"></span>
+      </section>
+
+      <button id="sign-out">Sign out</button>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
