@@ -19,7 +19,11 @@
     "plexivo-generate-types": "scripts/generate-types.mjs"
   },
   "scripts": {
-    "test": "node --test",
+    "test": "node --test test/*.test.js",
+    "test:e2e": "node test/e2e/run.mjs",
+    "test:e2e:pooled": "POOLED=1 node test/e2e/run.mjs",
+    "test:browser": "node test/browser/run.mjs",
+    "test:docs": "node test/docs/run.mjs",
     "pack:check": "npm pack --dry-run",
     "docs": "typedoc",
     "typecheck": "tsc -p tsconfig.json"
@@ -70,6 +74,11 @@
   ],
   "devDependencies": {
     "@types/node": "24.19.2",
+    "esbuild": "0.28.2",
+    "jsdom": "30.1.3",
+    "playwright-core": "1.62.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
     "typedoc": "0.28.20",
     "typescript": "6.0.3"
   }

@@ -4,6 +4,8 @@ node_modules/
 .env.*
 .DS_Store
 coverage/
-docs/
+/docs/
 !.env.example
 examples/browser/dist/
+test/docs/.out/
+package-lock.json
