@@ -370,7 +370,7 @@ export interface AuthClient {
   getSession(): Session | null;
   /**
    * The signed-in user, fresh from the server.
-   * @throws Error when no user is signed in.
+   * @throws PlexivoError `sign_in_required` (401) when no user is signed in.
    */
   getUser(): Promise<AppUser>;
   /**
@@ -392,7 +392,7 @@ export interface AuthClient {
    * request fails. Listeners get `'SIGNED_OUT'`.
    *
    * @param options - `scope`: `'local'` or `'global'`.
-   * @throws Error when no user is signed in (the local session is still cleared).
+   * Signing out while already signed out resolves at once and still reports `SIGNED_OUT`.
    *
    * @example
    * ```ts
@@ -2317,7 +2317,10 @@ export interface RealtimeChannel<T = Record<string, unknown>> {
    * @throws Error when the channel is not connected yet; wait for `ready()`.
    */
   sendBroadcast(event: string, payload?: Record<string, unknown>): RealtimeChannel<T>;
-  /** Resolves once the channel has joined. */
+  /**
+   * Resolves once the channel has joined.
+   * @throws PlexivoError (rejects) when the server refuses the join, with `code` such as `table_not_exposed` or `sign_in_required`.
+   */
   ready(): Promise<void>;
   /** Connects and joins. Calling it again does nothing. */
   subscribe(): RealtimeChannel<T>;

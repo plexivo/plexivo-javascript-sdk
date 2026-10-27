@@ -363,3 +363,62 @@ test('plexivo-generate-types writes types for the live Data API, not the old sta
     server.close();
   }
 });
+
+test('signOut while signed out resolves and still reports SIGNED_OUT', async () => {
+  let calls = 0;
+  const client = createClient('https://api.example/client/v1/demo', 'plx_publishable_test', {
+    fetch: async () => { calls++; return new Response('{}'); }, persistSession: false
+  });
+  const events = [];
+  client.auth.onAuthStateChange((event) => events.push(event));
+  await client.auth.signOut();
+  assert.deepEqual(events, ['SIGNED_OUT']);
+  assert.equal(calls, 0);
+});
+
+test('calls that need a user fail with a PlexivoError sign_in_required', async () => {
+  const {PlexivoError} = await import('../src/index.js');
+  const client = createClient('https://api.example/client/v1/demo', 'plx_publishable_test', {
+    fetch: async () => new Response('{}'), persistSession: false
+  });
+  await assert.rejects(client.auth.getUser(), (error) => {
+    assert.ok(error instanceof PlexivoError);
+    assert.equal(error.code, 'sign_in_required');
+    assert.equal(error.status, 401);
+    return true;
+  });
+});
+
+test('a refused realtime join rejects ready() and reaches graphql.subscribe', async () => {
+  const {PlexivoError} = await import('../src/index.js');
+  const sockets = [];
+  class FakeWebSocket {
+    constructor() { this.readyState = 1; this.handlers = new Map(); this.frames = []; sockets.push(this); }
+    addEventListener(name, handler) { this.handlers.set(name, handler); }
+    send(frame) { this.frames.push(JSON.parse(frame)); }
+    close() { this.readyState = 3; }
+    emit(name, data) { this.handlers.get(name)?.(data); }
+    refuseJoin(reason) {
+      const join = this.frames.find((f) => f[3] === 'phx_join');
+      this.emit('message', {data: JSON.stringify([null, join[1], join[2], 'phx_reply', {status: 'error', response: {reason}}])});
+    }
+  }
+  const client = createClient('https://api.example/client/v1/demo', 'plx_publishable_test', {WebSocket: FakeWebSocket, persistSession: false});
+
+  const errors = [];
+  const channel = client.channel('changes:secret').onError((e) => errors.push(e.code)).subscribe();
+  const ready = channel.ready();
+  sockets[0].emit('open', {});
+  sockets[0].refuseJoin('table_not_exposed');
+  await assert.rejects(ready, (error) => error instanceof PlexivoError && error.code === 'table_not_exposed');
+  assert.deepEqual(errors, ['table_not_exposed']);
+  channel.unsubscribe();
+
+  const results = [];
+  const live = client.graphql.subscribe('subscription { todos { id } }', {}, (r) => results.push(r));
+  sockets[1].emit('open', {});
+  sockets[1].refuseJoin('sign_in_required');
+  assert.equal(results.length, 1);
+  assert.equal(results[0].errors[0].extensions.code, 'sign_in_required');
+  live.unsubscribe();
+});

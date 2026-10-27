@@ -74,7 +74,9 @@ export function createClient(apiUrl, publishableKey, options = {}) {
     const headers = new Headers(init.headers || {});
     headers.set('apikey', publishableKey);
     headers.set('content-type', 'application/json');
-    if (authenticated === true && !session?.access_token) throw new Error('An authenticated application user is required');
+    if (authenticated === true && !session?.access_token) {
+      throw new PlexivoError('Sign in first: this needs a signed-in user', {status: 401, code: 'sign_in_required'});
+    }
     const sendToken = authenticated && session?.access_token;
     if (sendToken) {
       headers.set('authorization', `Bearer ${session.access_token}`);
@@ -144,6 +146,11 @@ export function createClient(apiUrl, publishableKey, options = {}) {
       setSession(null, 'USER_DELETED');
     },
     async signOut({scope = 'local'} = {}) {
+      // Already signed out: nothing to revoke on the server.
+      if (!session?.access_token) {
+        setSession(null, 'SIGNED_OUT');
+        return;
+      }
       try {
         await call('/auth/logout', {
           method: 'POST',
@@ -413,7 +420,7 @@ export function createClient(apiUrl, publishableKey, options = {}) {
     ch._onGraphql(id, onResult);
     ch._onJoin(() => ch._push('subscribe', {id, query, variables}).then((reply) => {
       if (reply.status !== 'ok') onResult({errors: reply.response?.errors || [{message: reply.response?.reason || 'subscribe failed'}]});
-    }));
+    }), (error) => onResult({errors: [{message: error.message, extensions: {code: error.code}}]}));
     ch.subscribe();
     return {unsubscribe: () => { ch._push('unsubscribe', {id}).catch(() => {}); ch.unsubscribe(); }};
   };
@@ -469,6 +476,7 @@ export function createClient(apiUrl, publishableKey, options = {}) {
     const presenceListeners = new Set();
     const graphqlListeners = new Map();
     const joinCallbacks = [];
+    const refusalCallbacks = [];
     const replies = new Map();
     let socket;
     let heartbeat;
@@ -515,10 +523,16 @@ export function createClient(apiUrl, publishableKey, options = {}) {
         replies.set(r, (reply) => {
           if (reply.status === 'ok') {
             joined = true;
+            refusalCallbacks.length = 0;
             joinCallbacks.splice(0).forEach((fn) => fn());
           } else {
-            const reason = reply.response?.reason || 'join refused';
-            for (const fn of errorListeners) fn(Object.assign(new Error(reason), {code: reason}));
+            // Refused (table_not_exposed, sign_in_required, …): the error
+            // listeners hear it and ready() rejects rather than waiting forever.
+            const reason = reply.response?.reason || 'join_refused';
+            const error = new PlexivoError(`Realtime refused to join ${topic}: ${reason}`, {code: reason});
+            joinCallbacks.length = 0;
+            refusalCallbacks.splice(0).forEach((fn) => fn(error));
+            for (const fn of errorListeners) fn(error);
           }
         });
         heartbeat = setInterval(() => send('heartbeat', {}, 'phoenix'), 25_000);
@@ -587,8 +601,12 @@ export function createClient(apiUrl, publishableKey, options = {}) {
         }
         return api;
       },
-      /** Resolves once the channel has joined. */
-      ready: () => new Promise((resolve) => (joined ? resolve() : joinCallbacks.push(resolve))),
+      /** Resolves once the channel has joined; rejects with a PlexivoError when the join is refused. */
+      ready: () => new Promise((resolve, reject) => {
+        if (joined) return resolve();
+        joinCallbacks.push(resolve);
+        refusalCallbacks.push(reject);
+      }),
       subscribe() {
         if (active) return api;
         active = true;
@@ -605,7 +623,11 @@ export function createClient(apiUrl, publishableKey, options = {}) {
         graphqlListeners.clear();
       },
       _push: push,
-      _onJoin: (fn) => (joined ? fn() : joinCallbacks.push(fn)),
+      _onJoin: (fn, onRefused) => {
+        if (joined) return fn();
+        joinCallbacks.push(fn);
+        if (onRefused) refusalCallbacks.push(onRefused);
+      },
       _onGraphql: (id, fn) => graphqlListeners.set(id, fn)
     };
     return api;
