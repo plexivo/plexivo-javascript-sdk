@@ -331,3 +331,35 @@ test('single() and sole() refuse several rows with a PlexivoError', async () => 
     });
   }
 });
+
+test('plexivo-generate-types writes types for the live Data API, not the old starter table', async () => {
+  const {createServer} = await import('node:http');
+  const {execFile} = await import('node:child_process');
+  const {promisify} = await import('node:util');
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push({url: req.url, apikey: req.headers.apikey});
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({
+      mode: 'rls',
+      tables: [{name: 'todos', kind: 'table', writable: true, primary_key: ['id'], comment: null, foreign_keys: [], columns: [
+        {name: 'id', type: 'bigint', not_null: true, has_default: true, read_only: false, comment: null},
+        {name: 'title', type: 'text', not_null: true, has_default: false, read_only: false, comment: null},
+        {name: 'done', type: 'boolean', not_null: true, has_default: true, read_only: false, comment: null}
+      ]}],
+      functions: []
+    }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${server.address().port}/client/v1/demo`;
+  try {
+    const {stdout} = await promisify(execFile)(process.execPath, [new URL('../scripts/generate-types.mjs', import.meta.url).pathname, '--url', url, '--key', 'plx_publishable_test']);
+    assert.equal(seen[0].url, '/client/v1/demo/meta/api');
+    assert.equal(seen[0].apikey, 'plx_publishable_test');
+    assert.match(stdout, /todos: \{/);
+    assert.match(stdout, /title: string;/);
+    assert.doesNotMatch(stdout, /items:/);
+  } finally {
+    server.close();
+  }
+});
