@@ -1,299 +1,1126 @@
 # @plexivo/client
 
-**The backend for your app, on PostgreSQL.** Plexivo Postgres is a Backend-as-a-Service — a Firebase alternative — that gives your web and mobile apps a real PostgreSQL database with authentication, a Data API, realtime, GraphQL with live queries, and Plexivo Functions. This is its client for JavaScript and TypeScript: browsers, React, Vue, React Native and Node.
+**Your app's backend, on PostgreSQL.** Plexivo Postgres is a Backend-as-a-Service: a real PostgreSQL database with sign-in, a Data API, joins of every kind, realtime, GraphQL with live queries, Plexivo Functions and files. This is its client for JavaScript and TypeScript — browsers, React, Next.js, Vue, React Native and Node.
 
 ```sh
 npm install @plexivo/client
 ```
 
-```js
-import { createClient } from '@plexivo/client';
+Row-level security in your database decides what every request may read and write, so your front end talks to your data directly — no API server to write, and nothing your policies do not allow.
 
-const db = createClient(PLEXIVO_URL, PLEXIVO_PUBLISHABLE_KEY);
+- **Two styles, one builder.** Write queries the Supabase way (`select('*, author:profiles(username)').eq(…)`) or the GORM way (models, `preload`, `whereHas`, `first`, `create`) — mix them freely.
+- **Everything PostgreSQL can join.** Many-to-one, one-to-many, many-to-many, nested, inner and left joins, ordering by a related column, subqueries, aggregates and views.
+- **Servers get the full power.** Raw SQL through the connection pooler, migrations and transactions with the secret key.
+- **Realtime that stays connected.** Row changes as each user may see them, presence and broadcast — rejoining by itself after a dropped connection or an expired session.
 
-await db.auth.signInWithPassword({ email, password });
-const todos = await db.from('todos').where('done', false).order('created_at', 'desc');
-```
-
-Row-level security in your database decides what every request may read and write, so the client can talk to your data directly — no API server to write.
-
-**Docs:** [plexivo.io/docs](https://plexivo.io/docs/) · **API reference:** `npm run docs` in this repository · **Examples:** [examples/](examples/README.md)
+Every code block on this page runs against a live Plexivo Postgres before each release.
 
 ## Contents
 
-[Quick start](#quick-start) · [Authentication](#authentication) · [Data](#data) · [Realtime](#realtime) · [GraphQL](#graphql-and-live-queries) · [Functions](#plexivo-functions) · [Files](#files) · [Errors](#errors) · [TypeScript](#typescript) · [Security](#security) · [Coming from Firebase](#coming-from-firebase) · [Models, relations and transactions](#models-relations-and-transactions) · [Server: SQL and migrations](#server-sql-and-migrations)
+[Quick start](#quick-start) · [Authentication](#authentication) · [Reading and writing](#reading-and-writing) · [Filters](#filters) · [Joins and related rows](#joins-and-related-rows) · [Aggregates](#aggregates) · [Upsert](#upsert) · [Bulk writes](#bulk-writes) · [Database functions and transactions](#database-functions-and-transactions) · [Raw SQL on your server](#raw-sql-on-your-server) · [Realtime](#realtime) · [Row-level security recipes](#row-level-security-recipes) · [Types](#types) · [GraphQL and live queries](#graphql-and-live-queries) · [Plexivo Functions and files](#plexivo-functions-and-files) · [React](#react) · [Next.js](#nextjs) · [Coming from Firebase](#coming-from-firebase) · [Coming from Supabase](#coming-from-supabase) · [Error handling](#error-handling) · [Security](#security)
 
 ## Quick start
 
 Five minutes from nothing to a working backend.
 
 1. **Create a Plexivo Postgres** in the [console](https://cloud.plexivo.io) and turn on its Data API.
-2. **Copy two values** from the database's **Connect** tab: the **Project URL** and the **publishable key**. The secret key is shown once when you turn the Data API on — keep it for servers only.
-3. **Create a table with a policy.** A table is visible to apps only when row-level security is on and a policy allows access. Run [`examples/schema.sql`](examples/schema.sql) once — with `psql` through `plexivo db connect YOUR_DATABASE`, or from your machine with the secret key:
+2. **Copy two values** from the database's **Connect** tab — the **Project URL** and the **publishable key** — into your environment as `PLEXIVO_DATA_URL` and `PLEXIVO_PUBLISHABLE_KEY`. The **secret key** is for servers only.
+3. **Create your tables.** Paste this into the console's SQL editor. A table reaches your app once row-level security is on and a policy allows access; the policies are the whole security model.
 
-   ```sh
-   cp examples/node/.env.example examples/node/.env   # fill in URL, publishable key, secret key
-   node --env-file=examples/node/.env examples/node/setup.ts
-   ```
+```sql
+CREATE TABLE profiles (
+  id uuid PRIMARY KEY DEFAULT auth.uid(),
+  username text NOT NULL UNIQUE,
+  country text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 
-   The heart of it:
+CREATE TABLE posts (
+  id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  author_id uuid NOT NULL DEFAULT auth.uid() REFERENCES profiles (id),
+  title text NOT NULL CHECK (length(title) BETWEEN 1 AND 200),
+  body text,
+  published boolean NOT NULL DEFAULT false,
+  likes integer NOT NULL DEFAULT 0,
+  tags text[] NOT NULL DEFAULT '{}',
+  meta jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 
-   ```sql
-   CREATE TABLE todos (
-     id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-     owner_id uuid NOT NULL DEFAULT auth.uid(),
-     title text NOT NULL,
-     done boolean NOT NULL DEFAULT false,
-     created_at timestamptz NOT NULL DEFAULT now()
-   );
-   ALTER TABLE todos ENABLE ROW LEVEL SECURITY;
-   CREATE POLICY own_todos ON todos FOR ALL TO authenticated
-     USING (owner_id = auth.uid()) WITH CHECK (owner_id = auth.uid());
-   GRANT SELECT, INSERT, UPDATE, DELETE ON todos TO authenticated;
-   ```
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "profiles are public" ON profiles FOR SELECT USING (true);
+CREATE POLICY "you create your own profile" ON profiles FOR INSERT TO authenticated WITH CHECK (id = auth.uid());
+CREATE POLICY "you edit your own profile" ON profiles FOR UPDATE TO authenticated USING (id = auth.uid());
 
-4. **Connect.**
+ALTER TABLE posts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "published posts are public; drafts are yours" ON posts FOR SELECT USING (published OR author_id = auth.uid());
+CREATE POLICY "you write your own posts" ON posts FOR ALL TO authenticated
+  USING (author_id = auth.uid()) WITH CHECK (author_id = auth.uid());
 
-   ```js
-   import { createClient } from '@plexivo/client';
+GRANT SELECT ON profiles, posts TO anon;
+GRANT SELECT, INSERT, UPDATE, DELETE ON profiles, posts TO authenticated;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO authenticated;
 
-   const db = createClient('https://…/client/v1/your-project', 'your-publishable-key');
+-- Live updates for posts (or switch Realtime on for the table in the console)
+CREATE TRIGGER plexivo_realtime AFTER INSERT OR UPDATE OR DELETE ON posts
+  FOR EACH ROW EXECUTE FUNCTION auth.realtime_notify('id');
+```
 
-   await db.auth.signUp({ email: 'ada@example.com', password: 'a long password' });
-   await db.from('todos').create({ title: 'Ship it' });
-   console.log(await db.from('todos').where('done', false));
-   ```
+4. **Use it.**
 
-For a browser app, add its origin (for example `http://localhost:5173`) to the Data API's allowed origins. Switch **Realtime** on per table in the console when you want live updates.
+```js
+import { createClient } from '@plexivo/client';
+
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+
+// Sign up: the session is kept and refreshed for you
+const { user } = await db.auth.signUp({
+  email: 'asha@example.com',
+  password: 'a long, unique password',
+  data: { display_name: 'Asha' }
+});
+await db.from('profiles').insert({ username: 'asha', country: 'IN' });
+
+// Write
+const post = await db.from('posts').create({ title: 'Hello, Plexivo Postgres', body: 'My first post', published: true });
+
+// Read, with the author joined in
+const { data: posts } = await db
+  .from('posts')
+  .select('id, title, author:profiles(username)')
+  .eq('published', true)
+  .order('created_at', { ascending: false });
+
+// Live updates
+const channel = db.channel('changes:posts')
+  .onChange(({ type, record }) => console.log(type, record.title))
+  .subscribe();
+```
+
+<!-- docs:check
+await channel.ready();
+assert.equal(user.email.endsWith('@example.com'), true);
+assert.equal(posts[0].author.username, 'asha');
+assert.equal(post.author_id, user.id);
+channel.unsubscribe();
+-->
+
+For a browser app, add its origin (for example `http://localhost:5173`) to the Data API's allowed origins. Every example below uses this `db`, signed in as Asha.
 
 ## Authentication
 
-Your app's own users, with sessions that refresh themselves. Policies see the signed-in user as `auth.uid()`.
+Your app's own users, with sessions that refresh themselves. In a policy, the signed-in user is `auth.uid()`.
+
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+-->
 
 ```js
-// Sign up and sign in
-await db.auth.signUp({ email, password });
-await db.auth.signInWithPassword({ email, password });
+// Email and password, with your own details about the user (up to 4 KB of JSON)
+const session = await db.auth.signUp({
+  email: 'ravi@example.com',
+  password: 'another long password',
+  data: { display_name: 'Ravi', plan: 'free' }
+});
+console.log(session.user.user_metadata);          // { display_name: 'Ravi', plan: 'free' }
 
-// Passwordless: an email code
-await db.auth.signInWithOtp({ email });
-await db.auth.verifyOtp({ email, token: code });
+await db.auth.signInWithPassword({ email: 'ravi@example.com', password: 'another long password' });
 
-// Google, GitHub or Microsoft (OAuth with PKCE)
-await db.auth.signInWithOAuth({ provider: 'google', redirectTo: location.origin });
-// …on the page you return to:
-await db.auth.exchangeCodeForSession(new URL(location.href).searchParams.get('code'));
+// Change the metadata later: keys merge, and null removes one
+const user = await db.auth.updateUser({ data: { plan: 'pro', display_name: null } });
+```
 
-// Guests who become accounts later, keeping their id and rows
-await db.auth.signInAnonymously();
-await db.auth.linkEmail({ email, password });
+<!-- docs:check
+assert.deepEqual(user.user_metadata, { plan: 'pro' });
+-->
 
-// The session and the user
-db.auth.getSession();                 // { access_token, refresh_token, expires_in, user } or null
-await db.auth.getUser();              // the user, as the server sees them
+The session and the user, and every device they are signed in on:
+
+```js
+db.auth.getSession();                    // { access_token, refresh_token, expires_in, user } or null
+const me = await db.auth.getUser();      // the user, as the server sees them
+
 const { data: { subscription } } = db.auth.onAuthStateChange((event, session) => {
   // SIGNED_UP, SIGNED_IN, TOKEN_REFRESHED, USER_UPDATED, SIGNED_OUT, …
 });
 
-// Devices, passwords, two-factor
-await db.auth.listSessions();         // signed-in devices; revokeSession(id) signs one out
-await db.auth.resetPasswordForEmail(email);
-await db.auth.verifyPasswordRecovery({ email, code, newPassword });
-await db.auth.mfa.enroll();           // TOTP: show factor.uri as a QR code
-await db.auth.mfa.verify({ code });
-
-// Sign out this device, or every device
-await db.auth.signOut();
-await db.auth.signOut({ scope: 'global' });
+const devices = await db.auth.listSessions();          // [{ id, current, user_agent, ip, created_at }]
+const elsewhere = devices.find((device) => !device.current);
+if (elsewhere) await db.auth.revokeSession(elsewhere.id);
+subscription.unsubscribe();
 ```
 
-In a browser the session is kept in `localStorage`. In React Native, pass encrypted storage: `createClient(url, key, { storage: { getItem, setItem, removeItem } })`. An expired access token is refreshed once and the request retried.
-
-Organisations for your users — roles, members and invitations — are built in: `db.orgs.create`, `invite`, `acceptInvitation`, `members`, `setRole`. Policies can check them with `auth.is_org_member(org_id)`.
-
-## Data
-
-Every table your policies allow, with filters, ordering and pages. Awaiting a query runs it.
+Guests start without an account and keep their id and rows when they sign up:
 
 ```js
-// Create — one row back, or many
-const todo = await db.from('todos').create({ title: 'Buy milk' });
-await db.from('todos').create([{ title: 'Book flights' }, { title: 'Call mum' }]);
+const app = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+const guest = await app.auth.signInAnonymously();
+const account = await app.auth.linkEmail({ email: 'meera@example.com', password: 'a guest no longer' });
+```
 
-// Read — filters, order, pagination
-const open = await db.from('todos')
-  .select('id, title, done')
-  .where('done', false)                     // = ; or where('likes', '>', 10)
-  .whereILike('title', '%milk%')
-  .whereIn('id', [1, 2, 3])
-  .order('created_at', 'desc')
-  .limit(20)
-  .offset(40);                              // or .page(3, 20), or .range(40, 59)
+<!-- docs:check
+assert.equal(account.user.id, guest.user.id);
+-->
 
-const page = await db.from('todos').paginate({ page: 2, perPage: 20 });
+One-time codes, OAuth and password recovery:
+
+```js
+// A six-digit code by email
+await db.auth.signInWithOtp({ email: 'ravi@example.com' });
+const confirmCode = (code) => db.auth.verifyOtp({ email: 'ravi@example.com', token: code });
+
+// Google, GitHub or Microsoft, with PKCE. In a browser, the redirect happens for you.
+const { url } = await db.auth.signInWithOAuth({ provider: 'github', redirectTo: 'https://app.example/auth/callback', skipBrowserRedirect: true });
+// …on the page you return to:
+const finishSignIn = (code) => db.auth.exchangeCodeForSession(code);
+
+// Forgotten passwords
+await db.auth.resetPasswordForEmail('ravi@example.com');
+const setNewPassword = (code, newPassword) => db.auth.verifyPasswordRecovery({ email: 'ravi@example.com', code, newPassword });
+
+// Sign out this device (or every device with { scope: 'global' })
+await db.auth.signOut();
+```
+
+In a browser the session is kept in `localStorage`. In React Native, pass encrypted storage: `createClient(url, key, { storage: { getItem, setItem, removeItem } })`. On a server, pass `{ persistSession: false }`. Two-factor authentication (`db.auth.mfa.enroll`, `verify`) and organisations for your users (`db.orgs.create`, `invite`, `members`, `setRole`) are built in too.
+
+## Reading and writing
+
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
+
+Awaiting a query runs it. Results are arrays that also carry `data` and `count`, so both styles read naturally.
+
+```js
+// Create: one row back, or many
+const draft = await db.from('posts').create({ title: 'Draft ideas', body: 'Not yet' });
+await db.from('posts').create([
+  { title: 'Postgres tips', body: 'Indexes, policies and plans', published: true, likes: 12, tags: ['postgres', 'sql'] },
+  { title: 'Cooking with rice', body: 'Curry and rice, done well', published: true, likes: 3, tags: ['food'] }
+]);
+
+// Read
+const popular = await db.from('posts').select('id, title, likes').eq('published', true).order('likes', { ascending: false });
+const one = await db.from('posts').first(draft.id);                  // RecordNotFoundError when it isn't there
+const { data: none } = await db.from('posts').eq('title', 'Nothing like this').maybeSingle();   // null
+
+// Update and delete, always with a filter
+await db.from('posts').where('id', draft.id).update({ body: 'Almost ready' });
+await db.from('posts').eq('id', draft.id).delete();
+```
+
+<!-- docs:check
+assert.equal(popular[0].title, 'Postgres tips');
+assert.equal(one.id, draft.id);
+assert.equal(none, null);
+assert.equal(await db.from('posts').where('id', draft.id).count(), 0);
+-->
+
+The Supabase shape, with an exact count and a page of rows:
+
+```js
+const { data, count } = await db.from('posts').select('id, title', { count: 'exact' }).eq('published', true).range(0, 9);
+```
+
+Prefer `{ data, error }` over exceptions? Create the client with `throwOnError: false`:
+
+```js
+const safe = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY, { throwOnError: false });
+const { data: rows, error } = await safe.from('no_such_table').select('*');
+if (error) console.log(error.code);              // 'table_not_exposed'
+```
+
+<!-- docs:check
+assert.equal(error.code, 'table_not_exposed');
+assert.equal(rows, null);
+-->
+
+Pages, counts, every row, and cancelling:
+
+```js
+const page = await db.from('posts').eq('published', true).order('id').paginate({ page: 1, perPage: 20 });
 // { data, total, page, perPage, totalPages }
 
-const one = await db.from('todos').first(todo.id);   // RecordNotFoundError if it isn't there
-const total = await db.from('todos').count();
+const total = await db.from('posts').count();
+const exists = await db.from('posts').where('likes', '>', 100).exists();
 
-// Update and delete — always with a filter
-await db.from('todos').where('id', todo.id).update({ done: true });
-await db.from('todos').where('done', true).delete();
+for await (const post of db.from('posts')) {
+  // every row, read 500 at a time
+}
 
-// Upsert
-await db.from('settings').upsert({ key: 'theme', value: 'dark' }, { onConflict: 'key' });
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 5000);
+const recent = await db.from('posts').order('created_at', { ascending: false }).limit(50).abortSignal(controller.signal);
 ```
 
-Results are arrays that also carry `data` and `count`, so both styles read naturally:
+<!-- docs:check
+assert.ok(page.total >= 3);
+assert.equal(exists, false);
+assert.ok(recent.length >= 3);
+-->
+
+An update or delete without a filter is refused before it is sent (`missing_where`); `.allowGlobalUpdate()` is the explicit way to touch every row.
+
+## Filters
+
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
+
+Every PostgreSQL comparison, by its Supabase name or GORM-style with an operator. Values are always sent as parameters.
+
+| Supabase style | GORM style | PostgreSQL |
+| --- | --- | --- |
+| `.eq('likes', 10)` / `.neq(…)` | `.where('likes', 10)` / `.where('likes', '!=', 10)` | `=` / `<>` |
+| `.gt` `.gte` `.lt` `.lte` | `.where('likes', '>', 10)` … | `>` `>=` `<` `<=` |
+| `.like('title', '%sql%')` / `.ilike(…)` | `.whereLike(…)` / `.whereILike(…)` | `LIKE` / `ILIKE` |
+| `.filter('title', 'match', '^Post')` | `.where('title', '~*', '^post')` | `~` / `~*` |
+| `.in('id', [1, 2])` | `.whereIn('id', [1, 2])` / `.whereNotIn(…)` | `IN` / `NOT IN` |
+| `.is('body', null)` | `.whereNull('body')` / `.whereNotNull(…)` | `IS NULL` |
+| `.contains('tags', ['sql'])` / `.containedBy(…)` / `.overlaps(…)` | `.whereContains(…)` / `.whereOverlaps(…)` | `@>` / `<@` / `&&` |
+| `.textSearch('search', 'fast cars', { type: 'websearch' })` | `.whereSearch('search', 'fast cars', 'english')` | full-text search |
+| `.not('likes', 'eq', 0)` | `.whereNot('likes', 0)` | `NOT` |
+| `.or('likes.gt.10,published.is.false')` | `.where(…).orWhere(…)`, `.where((q) => …)` | `OR`, groups |
+| `.match({ published: true })` | `.where({ published: true })` | every key equal |
+| — | `.whereJson('meta', 'lang.code', 'en')` | JSON paths |
+| — | `.whereBetween('likes', 5, 50)` | `BETWEEN` |
 
 ```js
-const { data, count } = await db.from('todos').select('*', { count: 'exact' }).eq('done', true);
+const picks = await db.from('posts')
+  .where('published', true)
+  .where((q) => q.where('likes', '>=', 10).orWhere('tags', 'contains', ['food']))
+  .whereNotNull('body')
+  .whereBetween('created_at', new Date('2026-01-01'), new Date())
+  .order('likes', 'desc');
+
+const same = await db.from('posts')
+  .eq('published', true)
+  .or('likes.gte.10,tags.cs.{food}')
+  .not('body', 'is', null)
+  .order('likes', { ascending: false });
 ```
 
-**Coming from Supabase?** The same builder speaks PostgREST: `select('id, author:authors(name)')`, `eq`, `neq`, `gt`, `in`, `is`, `ilike`, `or('a.eq.1,b.gt.2')`, `match`, `textSearch`, `range`, `single()`, `maybeSingle()`, `order(col, { ascending: false })`.
+<!-- docs:check
+assert.deepEqual(picks.map((p) => p.id), same.map((p) => p.id));
+assert.ok(picks.length >= 2);
+-->
 
-More conditions: `orWhere`, `whereNot`, groups `where((q) => q.where(…).orWhere(…))`, `whereBetween`, `whereNull`, `whereJson('meta', 'address.city', 'Pune')`, `whereContains` (arrays, jsonb), `whereSearch` (full-text), `whereHas('comments', …)`. Aggregates: `sum`, `avg`, `min`, `max`, `aggregate`, `groupBy().having()`. Reading everything: `findInBatches`, `each`, `for await (const row of query)`.
+**Inside JSON** and **arrays**:
 
-An update or delete without a filter is refused before it is sent (`missing_where`); `.allowGlobalUpdate()` is the explicit opt-in.
+```js
+await db.from('posts').where('id', (await db.from('posts').first()).id).update({ meta: { lang: { code: 'en' }, level: 2 } });
 
-Expose a database function to apps with `COMMENT ON FUNCTION … IS '@expose'` and call it with `await db.rpc('fn_name', { arg: 1 })`.
+const english = await db.from('posts').whereJson('meta', 'lang.code', 'en');
+const advanced = await db.from('posts').whereJson('meta', ['level'], '>=', 2);
+const tagged = await db.from('posts').contains('tags', ['postgres']).overlaps('tags', ['sql', 'food']);
+```
+
+<!-- docs:check
+assert.equal(english.length, 1);
+assert.equal(advanced.length, 1);
+assert.equal(tagged[0].title, 'Postgres tips');
+-->
+
+**Full-text search** over a generated column, with a GIN index to keep it fast:
+
+```sql
+ALTER TABLE posts ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || coalesce(body, ''))) STORED;
+CREATE INDEX posts_search ON posts USING gin (search);
+```
+
+```js
+const found = await db.from('posts')
+  .select('id, title')
+  .textSearch('search', '"policies and plans" -cooking', { type: 'websearch', config: 'english' });
+```
+
+<!-- docs:check
+assert.deepEqual(found.map((p) => p.title), ['Postgres tips']);
+-->
+
+`textSearch` takes `type: 'plain'`, `'phrase'` or `'websearch'` (or none, for PostgreSQL's own `to_tsquery` syntax).
+
+## Joins and related rows
+
+Your foreign keys are the joins. Each example below shows the Supabase style and the GORM style side by side; they send the same query.
+
+```sql
+CREATE TABLE comments (
+  id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  post_id bigint NOT NULL REFERENCES posts (id) ON DELETE CASCADE,
+  author_id uuid NOT NULL DEFAULT auth.uid() REFERENCES profiles (id),
+  body text NOT NULL,
+  approved boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE tags (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name text NOT NULL UNIQUE);
+CREATE TABLE post_tags (
+  post_id bigint NOT NULL REFERENCES posts (id) ON DELETE CASCADE,
+  tag_id bigint NOT NULL REFERENCES tags (id) ON DELETE CASCADE,
+  PRIMARY KEY (post_id, tag_id)
+);
+CREATE TABLE messages (
+  id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  sender_id uuid NOT NULL DEFAULT auth.uid() REFERENCES profiles (id),
+  recipient_id uuid NOT NULL REFERENCES profiles (id),
+  body text NOT NULL
+);
+
+ALTER TABLE comments ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "comments follow their post" ON comments FOR SELECT USING (EXISTS (SELECT 1 FROM posts p WHERE p.id = post_id));
+CREATE POLICY "you comment as yourself" ON comments FOR INSERT TO authenticated WITH CHECK (author_id = auth.uid());
+ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "tags are public" ON tags FOR SELECT USING (true);
+CREATE POLICY "anyone signed in adds tags" ON tags FOR INSERT TO authenticated WITH CHECK (true);
+ALTER TABLE post_tags ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "links follow their post" ON post_tags FOR SELECT USING (EXISTS (SELECT 1 FROM posts p WHERE p.id = post_id));
+CREATE POLICY "you tag your own posts" ON post_tags FOR ALL TO authenticated
+  USING (EXISTS (SELECT 1 FROM posts p WHERE p.id = post_id AND p.author_id = auth.uid()))
+  WITH CHECK (EXISTS (SELECT 1 FROM posts p WHERE p.id = post_id AND p.author_id = auth.uid()));
+ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "your conversations" ON messages FOR ALL TO authenticated
+  USING (auth.uid() IN (sender_id, recipient_id)) WITH CHECK (sender_id = auth.uid());
+
+GRANT SELECT ON comments, tags, post_tags TO anon;
+GRANT SELECT, INSERT, UPDATE, DELETE ON comments, tags, post_tags, messages TO authenticated;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO authenticated;
+```
+
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+const seeded = await db.from('posts').create({ title: 'Joins in Plexivo Postgres', body: 'Embeds, preloads and views', published: true, likes: 8 });
+const [pgTag, sqlTag] = await db.from('tags').create([{ name: 'postgres' }, { name: 'sql' }]);
+await db.from('post_tags').create([{ post_id: seeded.id, tag_id: pgTag.id }, { post_id: seeded.id, tag_id: sqlTag.id }]);
+await db.from('comments').create([{ post_id: seeded.id, body: 'Great read' }, { post_id: seeded.id, body: 'Pending review', approved: false }]);
+await db.from('messages').create({ recipient_id: (await db.auth.getUser()).id, body: 'Note to self' });
+-->
+
+For the GORM style, say once how tables relate — a model, like a GORM struct:
+
+```js
+import { belongsTo, hasMany, manyToMany } from '@plexivo/client';
+
+const Post = db.model('posts', {
+  relations: {
+    author: belongsTo('profiles', { foreignKey: 'author_id' }),
+    comments: hasMany('comments', { foreignKey: 'post_id' }),
+    tags: manyToMany('tags', { through: 'post_tags', foreignKey: 'post_id', otherKey: 'tag_id' })
+  },
+  scopes: { published: (q) => q.where('published', true) }
+});
+db.model('comments', { relations: { author: belongsTo('profiles', { foreignKey: 'author_id' }) } });
+```
+
+**Many-to-one** — each post with its author (an object, or `null`):
+
+```js
+const withAuthors = await db.from('posts').select('id, title, author:profiles(username)');
+const withAuthorsToo = await Post.query().select('id', 'title').preload('author', (a) => a.select('username'));
+```
+
+**One-to-many** — each post with its comments (an array), filtered, ordered and limited:
+
+```js
+const recent = await db.from('posts')
+  .select('title, comments(body, created_at)')
+  .order('created_at', { referencedTable: 'comments', ascending: false })
+  .limit(3, { referencedTable: 'comments' });
+
+const recentToo = await Post.query().preload('comments', (c) => c.where('approved', true).latest().limit(3));
+```
+
+<!-- docs:check
+const joined = recentToo.find((p) => p.id === seeded.id);
+assert.deepEqual(joined.comments.map((c) => c.body), ['Great read']);
+assert.ok(withAuthors.every((p) => p.author.username === 'asha'));
+-->
+
+**Many-to-many**, through a link table:
+
+```js
+const [tagged] = await db.from('posts').select('title, post_tags(tags(name))').eq('id', seeded.id);
+// { title, post_tags: [{ tags: { name: 'postgres' } }, …] }
+
+const taggedToo = await Post.query().preload('tags').first(seeded.id);
+// { …, tags: [{ id, name: 'postgres' }, …] }
+```
+
+<!-- docs:check
+assert.deepEqual(taggedToo.tags.map((t) => t.name).sort(), ['postgres', 'sql']);
+assert.equal(tagged.post_tags.length, 2);
+-->
+
+**Nested**, as deep as you need — GORM's `Preload("Comments.Author")` is a path:
+
+```js
+const threads = await db.from('posts').select('title, comments(body, author:profiles(username))');
+const threadsToo = await Post.query().preload('comments.author');
+```
+
+**Inner joins** keep only rows with a match; a plain embed or `preload` is a left join:
+
+```js
+const discussed = await db.from('posts').select('title, comments!inner(body)');
+const discussedToo = await Post.query().joins('comments', (c) => c.where('approved', true));
+```
+
+**Filter by related rows** without loading them (`EXISTS`):
+
+```js
+const withPending = await Post.query().whereHas('comments', (c) => c.where('approved', false));
+const quiet = await db.from('posts').whereDoesntHave('comments');
+const aboutPostgres = await Post.query().whereHas('tags', (t) => t.where('name', 'postgres'));
+```
+
+<!-- docs:check
+assert.deepEqual(withPending.map((p) => p.id), [seeded.id]);
+assert.deepEqual(aboutPostgres.map((p) => p.id), [seeded.id]);
+-->
+
+**Order by a related row's column** (GORM's `Joins("Author").Order("Author.username")`):
+
+```js
+const byAuthor = await db.from('posts').select('title').order('profiles.username').order('id');
+const byAuthorToo = await Post.query().select('title').order('author.username', 'desc');
+```
+
+**Subqueries** (GORM's `Where("author_id IN (?)", subquery)`), run under the subquery's own policies:
+
+```js
+const fromIndia = await db.from('posts')
+  .whereIn('author_id', db.from('profiles').select('id').eq('country', 'IN'))
+  .order('id');
+```
+
+<!-- docs:check
+assert.ok(fromIndia.length >= 3);
+-->
+
+**Two foreign keys to one table?** Name the one you mean with `table!constraint`:
+
+```js
+const inbox = await db.from('messages').select(`
+  body,
+  sender:profiles!messages_sender_id_fkey(username),
+  recipient:profiles!messages_recipient_id_fkey(username)
+`);
+```
+
+<!-- docs:check
+assert.equal(inbox[0].sender.username, 'asha');
+-->
+
+**Any join SQL can express** — window functions, `GROUP BY`, `LEFT JOIN LATERAL` — goes in a view. With `security_invoker`, each caller still sees only what their policies allow:
+
+```sql
+CREATE VIEW post_cards WITH (security_invoker = true) AS
+  SELECT p.id, p.title, p.likes, a.username AS author, count(c.id) AS comment_count
+  FROM posts p
+  JOIN profiles a ON a.id = p.author_id
+  LEFT JOIN comments c ON c.post_id = p.id
+  GROUP BY p.id, a.username;
+GRANT SELECT ON post_cards TO anon, authenticated;
+```
+
+```js
+const cards = await db.from('post_cards').select('*').gte('comment_count', 1).order('likes', { ascending: false });
+```
+
+<!-- docs:check
+assert.equal(cards[0].title, 'Joins in Plexivo Postgres');
+assert.equal(Number(cards[0].comment_count), 2);
+-->
+
+## Aggregates
+
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
+
+```js
+const posts = await db.from('posts').count();
+const likes = await db.from('posts').sum('likes');                  // also avg, min, max
+const summary = await db.from('posts').aggregate({ count: true, sum: ['likes'], max: ['likes'] });
+
+// GROUP BY … HAVING, ordered by an aggregate
+const perAuthor = await db.from('posts')
+  .groupBy('author_id')
+  .having('count', '>', 1)
+  .order('count(*)', 'desc')
+  .aggregate({ count: true, sum: ['likes'] });
+
+// Counts of related rows
+const withCounts = await db.from('posts').withCount('comments').where('published', true);
+const { data: counted } = await db.from('posts').select('title, comments(count)');
+```
+
+<!-- docs:check
+assert.ok(posts >= 4);
+assert.equal(Number(summary.count), posts);
+assert.equal(Number(perAuthor[0].count), posts);
+assert.ok(withCounts.some((p) => p.comments_count === 2));
+-->
+
+Sums and averages arrive as text, so no digit is lost; wrap them in `Number()` when they fit.
+
+## Upsert
+
+```sql
+CREATE TABLE products (
+  sku text NOT NULL,
+  region text NOT NULL,
+  name text NOT NULL,
+  price numeric(10, 2) NOT NULL CHECK (price >= 0),
+  stock integer NOT NULL DEFAULT 0,
+  PRIMARY KEY (sku, region)
+);
+ALTER TABLE products ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "signed-in users manage products" ON products FOR ALL TO authenticated USING (true) WITH CHECK (true);
+GRANT SELECT, INSERT, UPDATE, DELETE ON products TO authenticated;
+```
+
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
+
+```js
+// Insert, or update on conflict (a composite key here)
+await db.from('products').upsert(
+  [{ sku: 'MUG', region: 'IN', name: 'Mug', price: '4.50', stock: 10 },
+   { sku: 'MUG', region: 'GB', name: 'Mug', price: '5.00', stock: 4 }],
+  { onConflict: ['sku', 'region'] }
+);
+
+// On conflict, update only some columns
+await db.from('products').upsert(
+  { sku: 'MUG', region: 'IN', name: 'Mug', price: '4.50', stock: 12 },
+  { onConflict: ['sku', 'region'], update: ['stock'] }
+);
+
+// Insert only rows that are new; leave existing ones untouched
+const { data: added } = await db.from('products').upsert(
+  [{ sku: 'MUG', region: 'IN', name: 'Mug', price: '9.99' }, { sku: 'CAP', region: 'IN', name: 'Cap', price: '7.00' }],
+  { onConflict: ['sku', 'region'], ignoreDuplicates: true }
+);
+```
+
+<!-- docs:check
+assert.deepEqual(added.map((p) => p.sku), ['CAP']);
+const { data: mug } = await db.from('products').match({ sku: 'MUG', region: 'IN' }).select('price::text, stock').single();
+assert.deepEqual(mug, { price: '4.50', stock: 12 });
+-->
+
+GORM's `Save` is `save(row)`: an insert without a primary key, otherwise an update of every column it carries.
+
+## Bulk writes
+
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
+
+A request carries up to 1,000 rows. `create` with more sends them in batches of 1,000; `createInBatches` lets you choose.
+
+```js
+const items = Array.from({ length: 2500 }, (_, i) => ({ sku: `ITEM-${i}`, region: 'IN', name: `Item ${i}`, price: '1.00' }));
+await db.from('products').createInBatches(items, 1000);
+
+const { count: restocked } = await db.from('products').whereLike('sku', 'ITEM-%').returning('minimal').update({ stock: 5 });
+const { count: removed } = await db.from('products').whereLike('sku', 'ITEM-%').returning('minimal').delete();
+```
+
+<!-- docs:check
+assert.equal(restocked, 2500);
+assert.equal(removed, 2500);
+-->
+
+Updates and deletes by filter touch any number of rows in one statement. To make a batch all-or-nothing, put it in a [transaction](#database-functions-and-transactions).
+
+## Database functions and transactions
+
+Expose a function to apps with `@expose` in its comment. It runs as the caller, under their policies — or, with `SECURITY DEFINER`, as its owner, for a carefully chosen action.
+
+```sql
+CREATE FUNCTION search_posts(q text) RETURNS SETOF posts LANGUAGE sql STABLE AS $$
+  SELECT * FROM posts WHERE title ILIKE '%' || q || '%' OR body ILIKE '%' || q || '%'
+$$;
+COMMENT ON FUNCTION search_posts(text) IS 'Posts mentioning q. @expose';
+
+CREATE FUNCTION like_post(post_id bigint) RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = public AS $$
+  UPDATE posts SET likes = likes + 1 WHERE id = post_id AND published
+$$;
+COMMENT ON FUNCTION like_post(bigint) IS 'Anyone signed in may like a published post. @expose';
+REVOKE EXECUTE ON FUNCTION like_post(bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION like_post(bigint) TO authenticated;
+
+CREATE FUNCTION add(a integer, b integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT a + b $$;
+COMMENT ON FUNCTION add(integer, integer) IS '@expose';
+```
+
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
+
+```js
+const { data: five } = await db.rpc('add', { a: 2, b: 3 });
+
+// A function returning rows is queryable: columns, embeds, filters, order, paging, a count
+const { data: hits, count } = await db.rpc('search_posts', { q: 'post' }, { count: 'exact' })
+  .select('id, title, author:profiles(username)')
+  .eq('published', true)
+  .order('likes', { ascending: false })
+  .range(0, 9);
+
+const tips = await db.from('posts').eq('title', 'Postgres tips').single();
+await db.rpc('like_post', { post_id: tips.data.id });
+```
+
+<!-- docs:check
+assert.equal(five, 5);
+assert.ok(count >= 2 && hits.every((h) => h.author.username === 'asha'));
+-->
+
+**Transactions** send several operations in one request: all commit, or none do. Record them on `tx` without awaiting, and pass one result to the next with `.ref()`:
+
+```js
+const [post, comment] = await db.transaction((tx) => {
+  const post = tx.from('posts').create({ title: 'Launch notes', published: true });
+  tx.from('comments').create({ post_id: post.ref('id'), body: 'First!' });
+  tx.from('products').match({ sku: 'MUG', region: 'IN' }).lockForUpdate().find();   // a row lock until commit
+  tx.from('products').match({ sku: 'MUG', region: 'IN' }).decrement('stock');
+  tx.rpc('like_post', { post_id: post.ref('id') });
+});
+
+try {
+  await db.transaction((tx) => {
+    tx.from('posts').create({ title: 'Never saved' });
+    tx.from('posts').create({ title: '' });              // breaks the CHECK: everything rolls back
+  });
+} catch (error) {
+  console.log(error.code, error.operation);              // 'check_violation', 1
+}
+```
+
+<!-- docs:check
+assert.equal(comment.post_id, post.id);
+assert.equal(await db.from('posts').where('title', 'Never saved').count(), 0);
+-->
+
+For logic that must read and then decide inside the database, write a function and call it with `rpc`.
+
+## Raw SQL on your server
+
+With the **secret key**, on a server only, you have the full power of PostgreSQL: raw queries, statements, migrations and transactions. Every call runs through the **connection pooler**, so write pooler-safe SQL: values as parameters (never pasted into the text), and no session state — a `SET`, a temporary table or an advisory lock does not outlive its call. Put work that belongs together in one `sqlTransaction`.
+
+<!-- docs:setup
+import { createClient as setupClient } from '@plexivo/client';
+const userId = (await setupClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY).auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' })).user.id;
+-->
+
+```js
+import { createClient } from '@plexivo/client';
+
+const server = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_SECRET_KEY, { persistSession: false });
+
+// A tagged template: every ${value} is a parameter
+const top = await server.sql`SELECT id, title, likes FROM posts WHERE likes >= ${5} ORDER BY likes DESC`;
+
+// $1, $2 … parameters, and statements with row counts
+const [{ n }] = await server.raw('SELECT count(*)::int AS n FROM posts WHERE author_id = $1', [userId]);
+const { rowCount } = await server.exec('UPDATE products SET stock = stock + $1 WHERE region = $2', [1, 'IN']);
+
+// Several statements in one transaction: all commit, or none do
+await server.sqlTransaction([
+  'CREATE TABLE IF NOT EXISTS audit_log (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, what text NOT NULL, at timestamptz NOT NULL DEFAULT now())',
+  { sql: 'INSERT INTO audit_log (what) VALUES ($1), ($2)', params: ['restocked', 'reviewed'] }
+]);
+
+// The secret key bypasses row-level security in the Data API too
+const everything = await server.from('posts').select('id, title, published');
+```
+
+<!-- docs:check
+assert.ok(top.length >= 1 && n >= 4 && rowCount >= 2 && everything.length >= n);
+-->
+
+**Migrations**, versioned and applied once each:
+
+```js
+const migrations = [
+  { id: '2026_11_01_bookmarks',
+    up: 'CREATE TABLE bookmarks (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, owner_id uuid NOT NULL DEFAULT auth.uid(), url text NOT NULL)',
+    down: 'DROP TABLE bookmarks' },
+  { id: '2026_11_02_bookmark_title',
+    up: (m) => m.addColumn('bookmarks', 'title', 'text').createIndex('bookmarks', 'url'),
+    down: (m) => m.dropColumn('bookmarks', 'title') }
+];
+await server.migrate(migrations);                       // ['2026_11_01_bookmarks', '2026_11_02_bookmark_title']
+await server.migrator.hasColumn('bookmarks', 'title');  // true
+```
+
+The publishable key and signed-in users are refused by the SQL endpoint (`secret_key_required`), and the secret key is refused from any web page (`secret_key_in_browser`) — `createClient` itself refuses it in a browser.
 
 ## Realtime
 
-Row changes, as each subscriber is allowed to read them, plus rooms for broadcast and presence. Switch Realtime on for a table in the console first.
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
+
+Row changes reach each subscriber as their own policies allow — a draft never reaches anyone else. Rooms carry broadcast and presence for everyone who joins.
 
 ```js
 // Row changes, optionally filtered
-const feed = db.channel('changes:messages', { filter: 'room=eq.lobby' })
+const feed = db.channel('changes:posts', { filter: 'published=eq.true' })
   .onChange(({ type, record, old }) => {
     // type: 'insert' | 'update' | 'delete'
   })
-  .onError((error) => console.warn(error.code))
-  .subscribe();
+  .subscribe((status, error) => {
+    // 'SUBSCRIBED' on every (re)join, 'RECONNECTING', 'CHANNEL_ERROR' (refused), 'CLOSED'
+  });
+await feed.ready();
 
-// Rooms: broadcast and presence, nothing stored ('room:private:…' for signed-in users only)
+// Rooms: broadcast and presence ('room:private:…' for signed-in users only)
 const room = db.channel('room:lobby', { presence: { name: 'Asha' } })
   .onBroadcast('typing', (payload) => {})
   .onPresence(({ event, state }) => {})
   .subscribe();
 await room.ready();
 room.sendBroadcast('typing', { name: 'Asha' });
+```
 
+<!-- docs:check
+const seen = [];
+feed.onChange((c) => seen.push(c));
+const live = await db.from('posts').create({ title: 'Live!', published: true });
+for (let i = 0; i < 100 && !seen.some((c) => c.record?.id === live.id); i++) await new Promise((r) => setTimeout(r, 100));
+assert.ok(seen.some((c) => c.type === 'insert' && c.record.id === live.id));
+-->
+
+Channels stay joined by themselves. When the connection drops, or the session expires, the client refreshes the session if it needs to and joins again, with backoff; `channel.state` says where it is. A join the server refuses — an unknown table, a private room while signed out — is reported through `onError`, the status callback and `ready()`, and is not retried.
+
+```js
 feed.unsubscribe();
 room.unsubscribe();
 ```
 
-Channels reconnect on their own. Signed-out clients can subscribe where policies allow `anon`.
+## Row-level security recipes
 
-## GraphQL and live queries
+Policies are plain SQL, so they can say anything a `WHERE` clause can. The helpers: `auth.uid()`, `auth.role()`, `auth.email()`, `auth.jwt()`, `auth.is_anonymous()`, `auth.is_org_member(org)`, `auth.has_org_role(org, 'admin')`.
 
-A GraphQL API generated from your schema — exactly as wide as your policies allow.
+**Owner only** — each user sees and changes only their own rows:
 
-```js
-const { data, errors } = await db.graphql(
-  `query Open($limit: Int) {
-     todos(where: { done: { eq: false } }, orderBy: [{ created_at: DESC }], limit: $limit) { id title }
-     todosAggregate { count }
-   }`,
-  { limit: 10 }
+```sql
+ALTER TABLE bookmarks ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "your bookmarks" ON bookmarks FOR ALL TO authenticated
+  USING (owner_id = auth.uid()) WITH CHECK (owner_id = auth.uid());
+GRANT SELECT, INSERT, UPDATE, DELETE ON bookmarks TO authenticated;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO authenticated;
+```
+
+**Public read, signed-in write, guests read-only**, and **teams** with roles:
+
+```sql
+CREATE TABLE notices (
+  id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  org_id uuid,
+  author_id uuid NOT NULL DEFAULT auth.uid(),
+  body text NOT NULL
 );
+ALTER TABLE notices ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "public notices for everyone" ON notices FOR SELECT USING (org_id IS NULL);
+CREATE POLICY "team notices for the team" ON notices FOR SELECT TO authenticated USING (auth.is_org_member(org_id));
+CREATE POLICY "members post, guests do not" ON notices FOR INSERT TO authenticated
+  WITH CHECK (author_id = auth.uid() AND NOT auth.is_anonymous() AND (org_id IS NULL OR auth.is_org_member(org_id)));
+CREATE POLICY "admins tidy up" ON notices FOR DELETE TO authenticated USING (auth.has_org_role(org_id, 'admin'));
+GRANT SELECT ON notices TO anon;
+GRANT SELECT, INSERT, DELETE ON notices TO authenticated;
+```
 
-await db.graphql(`mutation { insertTodosOne(object: { title: "From GraphQL" }) { id } }`);
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
 
-// Automatic persisted queries: after the first call only a hash is sent
-await db.graphql(query, variables, { persisted: true });
+```js
+await db.from('bookmarks').create({ url: 'https://plexivo.io/docs' });
+await db.from('notices').create({ body: 'Welcome, everyone' });
 
-// A live query: the answer now, and again whenever a row it reads changes
-const live = db.graphql.subscribe('subscription { todosAggregate { count } }', {}, ({ data }) => {
-  console.log(data.todosAggregate.count);
+const signedOut = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+const visible = await signedOut.from('notices').select('body');          // the public notice
+const { error } = await createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY, { throwOnError: false })
+  .from('bookmarks').select('*');                                          // permission_denied: bookmarks are private
+```
+
+<!-- docs:check
+assert.deepEqual(visible.map((n) => n.body), ['Welcome, everyone']);
+assert.equal(error.code, 'permission_denied');
+-->
+
+Tips: give every policy a `TO` role; index the columns your policies compare (`owner_id`, `org_id`); keep `user_metadata` for display only — the user can change it — and decide access on `auth.uid()`, organisation roles or your own tables.
+
+## Types
+
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
+
+PostgreSQL types arrive as JSON, exactly:
+
+| PostgreSQL | JavaScript |
+| --- | --- |
+| `text`, `uuid`, enum | `string` |
+| `integer`, `double precision` | `number` |
+| `bigint`, `numeric` | `number` — select `column::text` to keep every digit as a string, and send strings |
+| `boolean` | `boolean` |
+| `timestamptz` | ISO 8601 string in UTC; send a `Date` or a string with any offset |
+| `date` | `'YYYY-MM-DD'` |
+| `json`, `jsonb` | objects and arrays |
+| `text[]`, `integer[]` | arrays |
+
+```sql
+CREATE TYPE order_status AS ENUM ('pending', 'paid', 'shipped');
+CREATE TABLE orders (
+  id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  owner_id uuid NOT NULL DEFAULT auth.uid(),
+  status order_status NOT NULL DEFAULT 'pending',
+  total numeric(14, 2) NOT NULL,
+  placed_at timestamptz NOT NULL DEFAULT now(),
+  deliver_on date,
+  items jsonb NOT NULL DEFAULT '[]',
+  notes text[] NOT NULL DEFAULT '{}'
+);
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "your orders" ON orders FOR ALL TO authenticated USING (owner_id = auth.uid()) WITH CHECK (owner_id = auth.uid());
+GRANT SELECT, INSERT, UPDATE ON orders TO authenticated;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO authenticated;
+```
+
+```js
+const order = await db.from('orders').create({
+  total: '123456789012.34',                       // numeric: send a string
+  placed_at: '2026-10-28T10:00:00+05:30',         // any offset; stored as one instant
+  deliver_on: '2026-11-02',
+  items: [{ sku: 'MUG', qty: 2 }],
+  notes: ['gift wrap', 'leave at door']
 });
-live.unsubscribe();
+
+const [row] = await db.from('orders').select('total::text, placed_at, deliver_on, status, items, notes').eq('id', order.id);
+// { total: '123456789012.34', placed_at: '2026-10-28T04:30:00+00:00', deliver_on: '2026-11-02', status: 'pending', … }
+
+await db.from('orders').where('id', order.id).update({ status: 'paid' });
+const paidToday = await db.from('orders').eq('status', 'paid').gte('placed_at', new Date('2026-10-28T00:00:00Z'));
 ```
 
-For each table you get `todos`, `todosByPk`, `todosAggregate`, and the mutations `insertTodos`, `insertTodosOne`, `updateTodos`, `updateTodosByPk`, `deleteTodos`, `deleteTodosByPk`. Foreign keys become nested fields. GraphQL errors come back as data, the way GraphQL returns them. Live queries need Realtime on for the tables they read.
+<!-- docs:check
+assert.equal(row.total, '123456789012.34');
+assert.equal(new Date(row.placed_at).toISOString(), '2026-10-28T04:30:00.000Z');
+assert.equal(row.deliver_on, '2026-11-02');
+assert.deepEqual(row.items, [{ sku: 'MUG', qty: 2 }]);
+assert.equal(paidToday.length, 1);
+-->
 
-## Plexivo Functions
-
-Your server-side code, beside your data. Deploy from the database's **Functions** tab; call from the app with the user's identity attached.
-
-```js
-// examples/functions/hello.js, deployed as `hello`
-export default async (req, ctx) => ({ message: `Hello, ${ctx.user ? 'friend' : 'visitor'}!` });
-```
-
-```js
-const { data, status } = await db.functions.invoke('hello', { body: { name: 'Ada' } });
-
-// Any method, a sub-path and a query string
-await db.functions.invoke('orders', { method: 'GET', path: 'recent', query: { limit: 10 } });
-```
-
-JSON bodies are sent and parsed for you; other responses come back as text. By default a function accepts only signed-in users and servers.
-
-## Files
-
-```js
-const object = await db.storage.upload('avatars/me.png', file, { contentType: 'image/png' });
-const { data, contentType } = await db.storage.download(object.id);
-const { signed_url } = await db.storage.createSignedDownloadUrl(object.id);
-await db.storage.remove(object.id);
-```
-
-Uploads and downloads go straight to storage through short-lived signed URLs.
-
-## Errors
-
-Every failure is a `PlexivoError` — the Data API's `code`, `message`, `hint`, `sqlstate`, the HTTP `status`, and a `traceId` to quote to support.
-
-```js
-import { PlexivoError, isNotFound, isUniqueViolation, isPermissionDenied } from '@plexivo/client';
-
-try {
-  await db.from('profiles').create({ username: 'ada' });
-} catch (error) {
-  if (isUniqueViolation(error)) return showMessage('That username is taken.');
-  if (isPermissionDenied(error)) return showMessage('You can’t do that.');
-  if (error instanceof PlexivoError) console.error(error.code, error.message, error.traceId);
-  throw error;
-}
-```
-
-Common codes: `invalid_credentials`, `email_taken`, `weak_password`, `token_expired`, `unique_violation`, `foreign_key_violation`, `check_violation`, `not_null_violation`, `permission_denied`, `table_not_exposed`, `missing_where`, `record_not_found`, `multiple_rows`, `sign_in_required`, `function_not_found`. A `429` means slow down: wait for its `Retry-After`.
-
-## TypeScript
-
-Full type definitions are included. Generate your project's types from its live Data API, then every table name, column, insert and update is checked:
+**TypeScript.** Full type definitions are included. Generate your project's own types from its live Data API, and every table, column, insert, update and function is checked:
 
 ```sh
-PLEXIVO_DATA_URL=https://… PLEXIVO_PUBLISHABLE_KEY=… npx plexivo-generate-types --output src/database.types.ts
+npx plexivo-generate-types --url $PLEXIVO_DATA_URL --key $PLEXIVO_PUBLISHABLE_KEY --output src/database.types.ts
 ```
 
 ```ts
 import { createClient } from '@plexivo/client';
 import type { Database } from './database.types';
 
-const db = createClient<Database>(url, key);
-const todos = await db.from('todos').where('done', false);   // Database['public']['Tables']['todos']['Row'][]
-await db.from('todos').create({ title: 'Typed' });             // checked against Insert
+const typed = createClient<Database>(process.env.PLEXIVO_DATA_URL!, process.env.PLEXIVO_PUBLISHABLE_KEY!);
+const latest = await typed.from('posts').where('published', true).limit(5);   // typed as Database['public']['Tables']['posts']['Row'][]
 ```
 
-## Security
+## GraphQL and live queries
 
-- **Row-level security is the gate.** A table reaches apps only with row-level security on and at least one policy. Write policies for `anon` (signed out) and `authenticated` (signed in), using `auth.uid()`, `auth.role()`, `auth.jwt()` and `auth.email()`.
-- **The publishable key is public.** It identifies your project and is safe in a browser or app bundle. It can do only what your policies allow.
-- **Never ship the secret key.** It bypasses row-level security and runs raw SQL. Keep it on servers and in CI secrets — never in a browser, a mobile app or a public repository. If it leaks, rotate it from the database's **Authentication** tab.
-- **Allow only your origins.** Browsers are accepted only from the origins you list for the Data API.
-- **Store sessions safely.** On mobile, keep sessions in encrypted storage.
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
+
+A GraphQL API generated from your schema — exactly as wide as your policies allow.
+
+```js
+const { data, errors } = await db.graphql(
+  `query Popular($limit: Int) {
+     posts(where: { published: { eq: true } }, orderBy: [{ likes: DESC }], limit: $limit) { id title likes }
+     postsAggregate { count }
+   }`,
+  { limit: 5 }
+);
+
+await db.graphql(`mutation { insertPostsOne(object: { title: "From GraphQL", published: true }) { id } }`);
+
+// A live query: the answer now, and again whenever a row it reads changes
+const live = db.graphql.subscribe('subscription { postsAggregate { count } }', {}, ({ data }) => {
+  console.log(data?.postsAggregate.count);
+});
+```
+
+<!-- docs:check
+assert.equal(errors, undefined);
+assert.ok(data.posts.length > 0);
+await new Promise((r) => setTimeout(r, 500));
+live.unsubscribe();
+-->
+
+For each table you get `posts`, `postsByPk`, `postsAggregate` and the mutations `insertPosts`, `insertPostsOne`, `updatePosts`, `updatePostsByPk`, `deletePosts`, `deletePostsByPk`. Foreign keys become nested fields; GraphQL errors come back as data. `{ persisted: true }` sends only a query's hash after the first call.
+
+## Plexivo Functions and files
+
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+-->
+
+Your own server-side code, beside your data, called with the user's identity attached. Deploy from the database's **Functions** tab.
+
+```js
+// Calls the `send-receipt` function: JSON in, JSON out
+async function sendReceipt(orderId) {
+  const { data } = await db.functions.invoke('send-receipt', { body: { orderId } });
+  return data;
+}
+
+// Files go straight to storage through short-lived signed URLs
+async function uploadAvatar(file) {
+  const object = await db.storage.upload(`avatars/${file.name}`, file, { contentType: file.type });
+  const { signed_url } = await db.storage.createSignedDownloadUrl(object.id);
+  return signed_url;
+}
+```
+
+## React
+
+A hook that loads posts and keeps them live, with a client created once for the app:
+
+<!-- docs:setup
+import { createClient as setupClient } from '@plexivo/client';
+await setupClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY).auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
+
+```jsx
+import { useEffect, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import { createClient } from '@plexivo/client';
+
+const db = createClient(import.meta.env.VITE_PLEXIVO_DATA_URL, import.meta.env.VITE_PLEXIVO_PUBLISHABLE_KEY);
+
+function usePosts() {
+  const [posts, setPosts] = useState([]);
+  useEffect(() => {
+    const load = () => db.from('posts').select('id, title').eq('published', true).order('id').then(setPosts);
+    load();
+    const channel = db.channel('changes:posts').onChange(load).subscribe();
+    return () => channel.unsubscribe();
+  }, []);
+  return posts;
+}
+
+function App() {
+  const posts = usePosts();
+  return <ul>{posts.map((post) => <li key={post.id}>{post.title}</li>)}</ul>;
+}
+
+createRoot(document.getElementById('root')).render(<App />);
+```
+
+<!-- docs:check
+for (let i = 0; i < 100 && document.querySelectorAll('li').length === 0; i++) await new Promise((r) => setTimeout(r, 100));
+assert.ok(document.body.textContent.includes('Hello, Plexivo Postgres'));
+-->
+
+The session lives in `localStorage`, so a reload keeps the user signed in; listen with `db.auth.onAuthStateChange` to switch screens.
+
+## Next.js
+
+<!-- docs:setup
+import { createClient as setupClient } from '@plexivo/client';
+const setup = setupClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+const signedIn = await setup.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+await setup.from('posts').create({ title: 'Unpublished thoughts' });
+-->
+
+A route handler that answers as the signed-in user — the browser sends its access token, and row-level security does the rest:
+
+```ts
+// app/api/posts/route.ts
+import { createClient } from '@plexivo/client';
+
+export async function GET(request: Request) {
+  const token = request.headers.get('authorization')?.replace(/^Bearer /, '');
+  const db = createClient(process.env.NEXT_PUBLIC_PLEXIVO_DATA_URL!, process.env.NEXT_PUBLIC_PLEXIVO_PUBLISHABLE_KEY!, {
+    persistSession: false,
+    ...(token ? { initialSession: { access_token: token } as any } : {})
+  });
+  const posts = await db.from('posts').select('id, title, published').order('id');
+  return Response.json(posts);
+}
+```
+
+A server action with the secret key, which never leaves the server:
+
+```ts
+// app/actions.ts
+'use server';
+import { createClient } from '@plexivo/client';
+
+export async function publishAnnouncement(formData: FormData) {
+  const server = createClient(process.env.NEXT_PUBLIC_PLEXIVO_DATA_URL!, process.env.PLEXIVO_SECRET_KEY!, { persistSession: false });
+  const [row] = await server.sql`INSERT INTO audit_log (what) VALUES (${String(formData.get('title'))}) RETURNING id`;
+  return row.id;
+}
+```
+
+<!-- docs:check
+const asSignedOut = await (await GET(new Request('http://localhost/api/posts'))).json();
+const asAsha = await (await GET(new Request('http://localhost/api/posts', { headers: { authorization: `Bearer ${signedIn.access_token}` } }))).json();
+assert.ok(asSignedOut.every((p) => p.published));
+assert.ok(asAsha.length > asSignedOut.length);
+const form = new FormData();
+form.set('title', 'Announced from a server action');
+assert.ok(await publishAnnouncement(form));
+-->
 
 ## Coming from Firebase
 
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
+
 | Firebase | Plexivo Postgres |
 | --- | --- |
-| Authentication: `createUserWithEmailAndPassword`, `signInWithEmailAndPassword` | `auth.signUp`, `auth.signInWithPassword` |
-| `onAuthStateChanged`, `signOut` | `auth.onAuthStateChange`, `auth.signOut` |
+| `createUserWithEmailAndPassword`, `signInWithEmailAndPassword` | `auth.signUp`, `auth.signInWithPassword` |
+| `onAuthStateChanged`, `signOut`, `updateProfile` | `auth.onAuthStateChange`, `auth.signOut`, `auth.updateUser({ data })` |
 | Anonymous sign-in, `linkWithCredential` | `auth.signInAnonymously`, `auth.linkEmail` |
 | Google / GitHub / Microsoft providers | `auth.signInWithOAuth({ provider })` |
-| Firestore collection / document | PostgreSQL table / row |
+| Firestore collection / document | table / row |
 | `addDoc`, `setDoc`, `updateDoc`, `deleteDoc` | `create`, `upsert` / `save`, `update`, `delete` |
 | `query(where(…), orderBy(…), limit(…), startAfter(…))` | `.where()`, `.order()`, `.limit()`, `.paginate()` / `.range()` |
 | `getCountFromServer`, `sum`, `average` | `.count()`, `.sum()`, `.avg()`, `.aggregate()` |
@@ -301,126 +1128,136 @@ await db.from('todos').create({ title: 'Typed' });             // checked agains
 | `onSnapshot` | `channel('changes:table').onChange()` or `graphql.subscribe()` |
 | Realtime Database presence | `channel('room:…', { presence })` |
 | `runTransaction`, `writeBatch` | `db.transaction()` |
-| Security Rules | Row-level security policies, in SQL |
-| Cloud Functions, `httpsCallable` | Plexivo Functions, `functions.invoke()` |
+| Security Rules | row-level security policies, in SQL |
+| Cloud Functions, `httpsCallable` | Plexivo Functions, `functions.invoke()`; database functions, `rpc()` |
 | Cloud Storage | `storage.upload()`, `storage.download()` |
 
-What you gain: SQL joins, constraints and transactions; GraphQL for free; your data in standard PostgreSQL you can query, back up and move.
-
-## Models, relations and transactions
-
-Declare a table once; queries then understand its relations, hooks, scopes and soft deletes — in the style of GORM.
+The same query, both ways:
 
 ```js
-import { belongsTo, hasMany, manyToMany } from '@plexivo/client';
-
-const Post = db.model('posts', {
-  softDelete: 'deleted_at',
-  relations: {
-    author: belongsTo('authors', { foreignKey: 'author_id' }),
-    comments: hasMany('comments', { foreignKey: 'post_id' }),
-    tags: manyToMany('tags', { through: 'post_tags', foreignKey: 'post_id', otherKey: 'tag_id' })
-  },
-  hooks: { beforeCreate: (row) => ({ ...row, slug: slugify(row.title) }) },
-  scopes: { published: (q) => q.where('published', true) }
-});
-
-const posts = await Post.query()
-  .scopes('published')
-  .preload('author', (a) => a.select('name'))
-  .preload('comments', (c) => c.where('approved', true).order('id', 'desc').limit(5))
-  .withCount('comments')
-  .whereHas('tags', (t) => t.where('name', 'postgres'));
-
-await Post.association(post, 'tags').append([tagId]);
+// Firestore:
+//   const q = query(collection(fs, 'posts'), where('published', '==', true), orderBy('likes', 'desc'), limit(10));
+//   onSnapshot(q, (snap) => render(snap.docs.map((d) => d.data())));
+const render = (rows) => {};
+const q = db.from('posts').where('published', '==', true).order('likes', 'desc').limit(10);
+render(await q);
+const snapshot = db.channel('changes:posts').onChange(async () => render(await q)).subscribe();
+snapshot.unsubscribe();
 ```
 
-Without a model, a relation is a table name and your foreign keys decide the join: `from('posts').preload('authors')`.
+What you gain: real joins, constraints, aggregates and transactions; SQL whenever you want it; GraphQL included; and your data in standard PostgreSQL that you can query, back up and move.
 
-**Transactions** commit together or not at all, in one request. Record operations without awaiting them, and pass one result to the next with `.ref()`:
+## Coming from Supabase
 
-```js
-const [author, post] = await db.transaction((tx) => {
-  const author = tx.from('authors').create({ name: 'Asha' });
-  tx.from('posts').create({ title: 'Hello', author_id: author.ref('id') });
-  tx.from('products').where('sku', 'B2').lockForUpdate().find();
-  tx.from('products').where('sku', 'B2').decrement('stock');
-});
-```
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
 
-If a step fails, everything rolls back and `error.operation` names the step.
+Your Supabase code reads the same; most of it runs unchanged.
 
-<details>
-<summary>GORM to @plexivo/client</summary>
-
-| GORM | @plexivo/client |
+| Supabase | Plexivo Postgres |
 | --- | --- |
-| `First`, `Last`, `Take`, `Find` | `.first()`, `.last()`, `.take()`, `.find()` |
-| `Where`, `Or`, `Not` | `.where()`, `.orWhere()`, `.whereNot()` |
-| `Order`, `Limit`, `Offset`, `Distinct`, `Group`, `Having` | `.order()`, `.limit()`, `.offset()`, `.distinct()`, `.groupBy()`, `.having()` |
-| `Joins`, `Preload` | `.joins()`, `.preload()` |
-| `Count`, `Pluck` | `.count()`, `.pluck()` |
-| `Create`, `CreateInBatches`, `Save`, `Clauses(OnConflict)` | `.create()`, `.createInBatches()`, `.save()`, `.upsert()` |
-| `Update`, `Updates`, `UpdateColumn`, `gorm.Expr("x - 1")` | `.update()`, `.updateColumn()`, `.decrement()` |
-| `Delete`, soft delete, `Unscoped` | `.delete()`, `softDelete`, `.unscoped()` |
-| `FirstOrCreate`, `FirstOrInit`, `FindInBatches` | `.firstOrCreate()`, `.firstOrInit()`, `.findInBatches()` |
-| `Scopes`, hooks, `Transaction`, `Locking` | `.scopes()`, `hooks`, `db.transaction()`, `.lockForUpdate()` |
-| `Association(...).Append/Replace/Delete/Clear/Count` | `Model.association(row, name).append/replace/delete/clear/count` |
-| `Raw`, `Exec`, `AutoMigrate`, `Migrator()` | `sql`, `raw`, `exec`, `migrator.autoMigrate()`, `migrator` |
-| `ErrRecordNotFound`, `DryRun` | `RecordNotFoundError`, `.toQuery()` |
-
-</details>
-
-## Server: SQL and migrations
-
-On a server, with the **secret key** only:
+| `createClient(url, anonKey)` | `createClient(url, publishableKey)` |
+| `{ data, error }` results | results carry `data`, `count` and `error`; `throwOnError: false` resolves failures as `{ data: null, error }` |
+| `select('*, author:profiles(username)')`, `!inner`, `!fk_name` | the same |
+| `eq`, `neq`, `gt`, `in`, `is`, `like`, `ilike`, `contains`, `or`, `not`, `match`, `textSearch`, `filter` | the same |
+| `order(col, { ascending, nullsFirst, referencedTable })`, `limit`, `range`, `single`, `maybeSingle` | the same |
+| `rpc('fn', args).eq(…).order(…)` | the same |
+| `insert`, `update`, `upsert({ onConflict, ignoreDuplicates })`, `delete` | the same |
+| `auth.signUp({ options: { data } })`, `auth.updateUser({ data })`, `user_metadata` | the same |
+| `channel(…).on('postgres_changes', …)` | `channel('changes:table', { filter }).onChange(…)` |
+| Presence and broadcast | `channel('room:name', { presence })`, `sendBroadcast`, `onBroadcast` |
+| `auth.uid()`, `auth.jwt()` in policies | the same |
+| `abortSignal(signal)` | the same |
 
 ```js
-const server = createClient(PLEXIVO_URL, process.env.PLEXIVO_SECRET_KEY, { persistSession: false });
-
-const rows = await server.sql`select * from orders where total > ${100}`;   // parameters, never string-built SQL
-await server.exec('update orders set status = $1 where id = $2', ['shipped', id]);
-await server.sqlTransaction(['create table a (id int)', { sql: 'insert into a values ($1)', params: [1] }]);
-
-// Versioned migrations, each applied once and recorded in plexivo_migrations
-await server.migrate([
-  { id: '2026_11_01_tags', up: 'create table tags (id bigserial primary key, name text unique)', down: 'drop table tags' }
-]);
-
-// Or create what's missing from models with columns (never drops anything)
-await server.migrator.autoMigrate(Post, Comment);
+const { data, error } = await db
+  .from('posts')
+  .select('title, profiles(username), comments(count)')
+  .eq('published', true)
+  .order('created_at', { ascending: false })
+  .limit(5);
 ```
 
-The publishable key and signed-in users are refused by the SQL endpoint whatever they send.
+<!-- docs:check
+assert.equal(error, null);
+assert.ok(data.length > 0 && data[0].profiles.username === 'asha');
+-->
 
-## Examples
+And more besides: GORM-style models and `preload('comments.author')`, ordering by a related column, `whereIn` with a subquery, `whereHas`, grouped aggregates with `having`, `withCount`, transactions with references, and raw SQL on your server. Bring your users with you: `server.auth.admin.importFromSupabase()` keeps their password hashes, so nobody needs a new password.
 
-Runnable, with no keys in the code — each reads your project from `.env`:
+## Error handling
 
-| | |
-| --- | --- |
-| [`examples/node/auth.ts`](examples/node/auth.ts) | Sign up, sign in, session, devices, sign out |
-| [`examples/node/todos.ts`](examples/node/todos.ts) | CRUD with filters, order, pagination and errors |
-| [`examples/node/chat.ts`](examples/node/chat.ts) | Realtime chat: row changes, broadcast, presence |
-| [`examples/node/graphql-live.ts`](examples/node/graphql-live.ts) | GraphQL query, mutation and a live query |
-| [`examples/node/call-function.ts`](examples/node/call-function.ts) | Calling a Plexivo Function |
-| [`examples/browser`](examples/browser/README.md) | A Vite app: sign-in, live todos, chat, a function |
+<!-- docs:setup
+import { createClient } from '@plexivo/client';
+const db = createClient(process.env.PLEXIVO_DATA_URL, process.env.PLEXIVO_PUBLISHABLE_KEY);
+await db.auth.signInWithPassword({ email: 'asha@example.com', password: 'a long, unique password' });
+-->
 
-```sh
-cp examples/node/.env.example examples/node/.env      # your Project URL and publishable key
-node --env-file=examples/node/.env examples/node/todos.ts
+Every failure is a `PlexivoError` with the HTTP `status`, a stable `code`, a `message`, the PostgreSQL `sqlstate` and `hint` when the database has them, and a `traceId` to quote to support.
+
+```js
+import { PlexivoError, isNotFound, isUniqueViolation, isPermissionDenied } from '@plexivo/client';
+
+async function claimUsername(username) {
+  try {
+    await db.from('profiles').update({ username }).eq('id', (await db.auth.getUser()).id);
+    return 'Saved';
+  } catch (error) {
+    if (isUniqueViolation(error)) return 'That username is taken.';
+    if (isPermissionDenied(error)) return 'You can only change your own profile.';
+    if (error instanceof PlexivoError) console.error(error.code, error.sqlstate, error.traceId);
+    throw error;
+  }
+}
+
+await db.auth.signUp({ email: 'kiran@example.com', password: 'yet another long password' });
+await db.from('profiles').insert({ username: 'kiran' });
+const answer = await claimUsername('asha');            // 'That username is taken.'
 ```
 
-The Node examples use Node 22.18 or later (they run TypeScript directly). The client itself needs Node 20 or later, or any modern browser.
+<!-- docs:check
+assert.equal(answer, 'That username is taken.');
+-->
 
-## Development
+| Code | Status | When |
+| --- | --- | --- |
+| `invalid_credentials` | 401 | A wrong email or password |
+| `email_taken`, `weak_password` | 409, 422 | Sign-up refused |
+| `invalid_passwordless_code`, `invalid_recovery_code` | 401 | A wrong one-time or recovery code |
+| `sign_in_required` | 401 | The call needs a signed-in user |
+| `token_expired` | 401 | Refreshed for you and retried once; you see it only when the refresh fails |
+| `invalid_access_token`, `invalid_refresh_token` | 401 | A token that is not this project's, or was revoked |
+| `invalid_api_key` | 401 | A missing or wrong key |
+| `origin_denied` | 403 | A browser origin not in the Data API's allowed origins |
+| `secret_key_in_browser` | 403 | The secret key used from a web page (also thrown by `createClient` in a browser) |
+| `secret_key_required` | 403 | Raw SQL without the secret key |
+| `permission_denied` | 403 | Row-level security or a grant refused it (`sqlstate` `42501`) |
+| `table_not_exposed`, `function_not_exposed` | 404 | Not visible to the Data API (no policy, or no `@expose`) |
+| `record_not_found` | 404 | `first()`, `single()` and friends found nothing |
+| `unique_violation`, `foreign_key_violation` | 409 | Constraint violations (`23505`, `23503`) |
+| `check_violation`, `not_null_violation`, `invalid_value` | 400 | Constraint and type errors (`23514`, `23502`, `22…`) |
+| `invalid_request` | 400 | A request the Data API cannot run: an unknown column, a malformed filter |
+| `missing_where` | — | An update or delete without a filter, refused before sending |
+| `multiple_rows` | 406 | `single()`, `maybeSingle()` or `sole()` found several |
+| `rate_limited` | 429 | Slow down: `error.retryAfter` says how many seconds |
+| `too_large` | 413 | A request body over the limit; send rows in batches |
+| `aborted`, `network_error` | 0 | Cancelled by your `abortSignal`, or no answer at all (`error.cause` has the reason) |
 
-```sh
-npm test            # unit tests
-npm run typecheck   # types and examples
-npm run docs        # API reference in docs/api
-npm pack --dry-run
-```
+In a transaction, `error.operation` names the step that failed.
+
+## Security
+
+- **Row-level security is the gate.** A table reaches apps only with row-level security on and at least one policy; a view only with `security_invoker`; a function only with `@expose`.
+- **The publishable key is public.** It identifies your project and is made for browsers and app bundles. It can do only what your policies allow.
+- **The secret key stays on servers.** It bypasses row-level security and runs raw SQL. `createClient` refuses it in a browser, and the platform refuses it from any web page. Keep it in your server's environment and CI secrets; rotate it from the database's **Authentication** tab whenever you like.
+- **Allow only your origins.** Browsers are accepted only from the origins you list for the Data API.
+- **Every value is a parameter.** Filters, JSON paths, function arguments and raw SQL parameters are sent as values, never as SQL text; names are checked against your schema.
+- **Store sessions safely.** On mobile, keep sessions in encrypted storage.
+
+The API reference is in the type definitions (and `npm run docs` in this repository); runnable Node and Vite examples are in [`examples/`](examples/README.md).
 
 ## License
 
