@@ -14,7 +14,8 @@ import assert from 'node:assert/strict';
 
 export {assert};
 
-const CONTROL = process.env.PLEXIVO_HARNESS_CONTROL || 'http://127.0.0.1:47801';
+// The control endpoint's base, with or without its /projects path.
+const CONTROL = (process.env.PLEXIVO_HARNESS_CONTROL || 'http://127.0.0.1:47801').replace(/\/projects\/?$/, '');
 export const POOLED = process.env.POOLED === '1';
 
 /** The module the suites test: this checkout, or an installed copy (PLEXIVO_SDK_ENTRY). */
