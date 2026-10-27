@@ -47,7 +47,10 @@ export type Credentials = {
   /** For {@link AuthClient.signUp}: your own details about the user (a JSON object of at most 4 KB), kept as `user_metadata`. */
   data?: { [key: string]: Json };
   /** Supabase's form: `options.data` is the same as `data`. */
-  options?: { data?: { [key: string]: Json } };
+  options?: {
+    /** The same as `data`. */
+    data?: { [key: string]: Json };
+  };
 };
 
 /** One of your app's users. Its `id` is `auth.uid()` in row-level security policies. */
@@ -2074,7 +2077,7 @@ export interface TransactionClient<TDatabase extends DatabaseDefinition = Defaul
    * @param args - Its arguments, by name (values may hold refs).
    * @returns A handle resolving to `{ data, count, error: null }`.
    */
-  rpc<T = any>(fn: string, args?: Record<string, unknown>): TxHandle<{ data: T; count: number | null; error: null }>;
+  rpc<T = any>(fn: string, args?: Record<string, unknown>): TxHandle<RpcResult<T>>;
 }
 /** Values whose columns may also be a {@link Ref} to an earlier operation's result. */
 export type WithRefs<T> = { [K in keyof T]: T[K] | Ref };
@@ -2857,6 +2860,7 @@ export interface RpcBuilder<T = unknown, Throws extends boolean = true> extends 
   finally(onfinally?: () => void): Promise<Outcome<RpcResult<T>, Throws>>;
 }
 
+/** The functions of a database type, or any function when it has none. */
 type Functions<D extends DatabaseDefinition> = D['public'] extends {
   /** The functions. */
   Functions: infer F;
@@ -3215,5 +3219,6 @@ export const VERSION: string;
  * The {@link RpcBuilder} class, for `instanceof` checks.
  */
 export const RpcBuilder: {
+  /** The prototype every function-call builder shares. */
   prototype: RpcBuilder<unknown, boolean>;
 };

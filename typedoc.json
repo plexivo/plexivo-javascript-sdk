@@ -6,7 +6,7 @@
   "readme": "README.md",
   "tsconfig": "tsconfig.json",
   "excludeExternals": true,
-  "highlightLanguages": ["bash", "console", "css", "html", "javascript", "json", "jsonc", "json5", "sh", "sql", "tsx", "typescript", "yaml"],
+  "highlightLanguages": ["bash", "console", "css", "html", "javascript", "json", "jsx", "jsonc", "json5", "sh", "sql", "tsx", "typescript", "yaml"],
   "validation": {
     "notExported": true,
     "invalidLink": true,
