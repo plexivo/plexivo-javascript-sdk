@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.4.0
+
+Every join GORM and Supabase know, on Plexivo Postgres — tested end to end
+against a live project, directly and through the connection pooler, in Node
+and in a real browser.
+
+- **Order by a related row's column** (GORM's `Joins("Author").Order("Author.name")`):
+  `order('profiles.username', 'desc')`, or `order('username', {relation: 'profiles', hint})`;
+  a model relation name works too. Supabase's `order(col, {referencedTable})`
+  (or `foreignTable`) sorts an embed's rows, and `limit` / `offset` /
+  `range` take `{referencedTable}` as well.
+- **Subqueries**: `whereIn('author_id', db.from('profiles').select('id').where(…))`,
+  `whereNotIn`, `in` — run under the subquery's own row-level security.
+- **Queryable functions**: `db.rpc(fn, args, {count: 'exact'})` is still
+  awaitable as before, and now chains `select` (with embeds), filters,
+  `order`, `limit`, `range`, `single` and `maybeSingle` for functions that
+  return rows. `tx.rpc()` records a call inside a transaction.
+- **Nested preload by path**: `preload('comments.author')` (GORM's
+  `Preload("Comments.Author")`), merged into an existing `preload('comments', …)`;
+  `joins()` takes paths too. `latest()` / `oldest()` work inside embeds.
+- **`throwOnError: false`**: awaited queries and `rpc()` resolve failures as
+  `{data: null, count: null, error}`, Supabase style (typed as `Failure`).
+  The default still throws, as in 0.3.
+- **`abortSignal(signal)`** on queries and function calls; a cancelled request
+  fails with code `aborted`. A request with no answer is now a `PlexivoError`
+  coded `network_error` (the original error is `cause`). `error.retryAfter`
+  carries a 429's `Retry-After`.
+- **User metadata**: `signUp({email, password, data})` (or Supabase's
+  `options.data`), `auth.updateUser({data})` (keys merge; `null` removes),
+  and `user.user_metadata`.
+- **Realtime that stays joined**: when the connection drops or the server
+  ends a channel (an expired token, a restart), the channel refreshes the
+  session if it needs to and joins again with backoff; it also moves to a
+  refreshed session before the old token expires, and after sign-in or
+  sign-out. A refused join is reported and not retried. New:
+  `channel.state`, `channel.joined`, `onStatus()` and `subscribe(callback)`
+  with `SUBSCRIBED` / `RECONNECTING` / `CHANNEL_ERROR` / `CLOSED`; a missed
+  heartbeat reconnects; live GraphQL subscriptions resume after a rejoin.
+- **The secret key is refused in a browser**: `createClient` throws a
+  `PlexivoError` coded `secret_key_in_browser` in a web page or worker.
+- `VERSION` export; `RpcBuilder`, `ClientOptions`, `Failure`, `Outcome`,
+  `Subquery`, `EmbedTarget`, `ChannelStatus` and `RpcResult` types.
+- **Documentation**: a new README — a five-minute quick start, auth, CRUD,
+  filters, joins of every kind side by side in both styles, aggregates,
+  upserts, bulk writes, functions and transactions, raw SQL through the
+  connection pooler, realtime, row-level security recipes, types, React,
+  Next.js, coming from Firebase or Supabase, and an error-code table. Every
+  code block in it runs against a live project before release
+  (`npm run test:docs`).
+- **Tests**: `npm run test:e2e` (direct and `POOLED=1`), `npm run test:browser`
+  (headless Chrome) and `npm run test:docs`. `npm test` runs the unit tests only.
+
 ## 0.3.0
 
 Plexivo Postgres as a Backend-as-a-Service, documented end to end.

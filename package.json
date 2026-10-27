@@ -1,7 +1,7 @@
 {
   "name": "@plexivo/client",
-  "version": "0.3.0",
-  "description": "Plexivo Postgres for JavaScript and TypeScript: a Backend-as-a-Service and Firebase alternative on PostgreSQL. Auth, Data API queries, realtime, GraphQL live queries, Plexivo Functions and file storage.",
+  "version": "0.4.0",
+  "description": "Plexivo Postgres for JavaScript and TypeScript: a Backend-as-a-Service on PostgreSQL. Auth, joins of every kind, Supabase-style and GORM-style queries, realtime, GraphQL live queries, raw SQL through the connection pooler, Plexivo Functions and files.",
   "type": "module",
   "main": "./src/index.js",
   "types": "./index.d.ts",
