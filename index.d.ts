@@ -1943,12 +1943,31 @@ export interface TransactionClient<TDatabase extends DatabaseDefinition = Defaul
    * A query on one table, recorded into the transaction.
    * @param table - The table name.
    */
-  from<TName extends TableName<TDatabase>>(table: TName): QueryBuilder<RowOf<TDatabase, TName>, InsertOf<TDatabase, TName>, UpdateOf<TDatabase, TName>>;
+  from<TName extends TableName<TDatabase>>(table: TName): TxQueryBuilder<RowOf<TDatabase, TName>, InsertOf<TDatabase, TName>, UpdateOf<TDatabase, TName>>;
   /**
    * Same as `from`.
    * @param table - The table name.
    */
-  table<TName extends TableName<TDatabase>>(table: TName): QueryBuilder<RowOf<TDatabase, TName>, InsertOf<TDatabase, TName>, UpdateOf<TDatabase, TName>>;
+  table<TName extends TableName<TDatabase>>(table: TName): TxQueryBuilder<RowOf<TDatabase, TName>, InsertOf<TDatabase, TName>, UpdateOf<TDatabase, TName>>;
+}
+/** Values whose columns may also be a {@link Ref} to an earlier operation's result. */
+export type WithRefs<T> = { [K in keyof T]: T[K] | Ref };
+/**
+ * A query builder inside {@link PlexivoClient.transaction}: the same builder,
+ * but `create` records the insert and returns a {@link TxHandle}, so a later
+ * operation can use its result with `handle.ref('id')`, and values may hold refs.
+ */
+export interface TxQueryBuilder<Row = Record<string, unknown>, Insert = Partial<Row>, Update = Partial<Row>>
+  extends QueryBuilder<Row, Insert, Update> {
+  /**
+   * Records an insert of one or more rows (values may hold refs).
+   * @param values - The row, or rows.
+   * @param options - `returning: 'minimal'` for the count only; `omit` / `only` keys.
+   * @returns A handle: await it after the transaction, or pass `handle.ref('column')` on.
+   */
+  create(values: WithRefs<Insert>, options?: { omit?: string[]; only?: string[] }): TxHandle<Row>;
+  create(values: WithRefs<Insert>[], options?: { omit?: string[]; only?: string[] }): TxHandle<Row[]>;
+  create(values: WithRefs<Insert> | WithRefs<Insert>[], options: { returning: 'minimal'; omit?: string[]; only?: string[] }): TxHandle<number>;
 }
 /**
  * Inside `transaction()`, every operation returns a handle: await it after

@@ -21,7 +21,8 @@ Plexivo Postgres as a Backend-as-a-Service, documented end to end.
   `graphql.subscribe`. `plexivo-generate-types` reads the live Data API
   instead of the old starter table.
 - Type declarations: `PlexivoError` and `RecordNotFoundError` constructors;
-  `create(…, {returning: 'minimal'})` resolves to a count.
+  `create(…, {returning: 'minimal'})` resolves to a count; inside a transaction
+  `create` is typed as a handle with `.ref()`, and values may hold refs.
 
 ## 0.2.0
 
