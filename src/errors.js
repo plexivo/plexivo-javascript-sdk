@@ -4,8 +4,8 @@
 // no row matches, like GORM's ErrRecordNotFound.
 
 export class PlexivoError extends Error {
-  constructor(message, {status = 0, code, hint, sqlstate, traceId = null, details, operation} = {}) {
-    super(message);
+  constructor(message, {status = 0, code, hint, sqlstate, traceId = null, details, operation, retryAfter, cause} = {}) {
+    super(message, cause === undefined ? undefined : {cause});
     this.name = 'PlexivoError';
     this.status = status;
     this.code = code;
@@ -14,6 +14,7 @@ export class PlexivoError extends Error {
     this.traceId = traceId;
     if (details !== undefined) this.details = details;
     if (operation !== undefined) this.operation = operation;
+    if (retryAfter !== undefined) this.retryAfter = retryAfter;
   }
 }
 
@@ -38,6 +39,7 @@ export const isPermissionDenied = (error) => error?.code === 'permission_denied'
 export function apiError(response, payload, lastTraceId) {
   const e = payload?.error || {};
   const failed = response.headers?.get?.('x-plexivo-failed-operation') ?? response.headers?.get?.('x-plexivo-failed-statement');
+  const retry = response.headers?.get?.('retry-after') ?? e.retry_after;
   return new PlexivoError(e.message || e.code || `HTTP ${response.status}`, {
     status: response.status,
     code: e.code,
@@ -45,6 +47,7 @@ export function apiError(response, payload, lastTraceId) {
     sqlstate: e.sqlstate ?? undefined,
     traceId: payload?.trace_id || lastTraceId,
     details: e.details,
-    operation: failed == null ? undefined : Number(failed)
+    operation: failed == null ? undefined : Number(failed),
+    retryAfter: retry == null || retry === '' || Number.isNaN(Number(retry)) ? undefined : Number(retry)
   });
 }

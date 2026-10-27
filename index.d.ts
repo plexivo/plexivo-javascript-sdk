@@ -44,6 +44,10 @@ export type Credentials = {
   password: string;
   /** The current code from the user's authenticator app. Needed only when the account has two-factor authentication on. */
   mfa_code?: string;
+  /** For {@link AuthClient.signUp}: your own details about the user (a JSON object of at most 4 KB), kept as `user_metadata`. */
+  data?: { [key: string]: Json };
+  /** Supabase's form: `options.data` is the same as `data`. */
+  options?: { data?: { [key: string]: Json } };
 };
 
 /** One of your app's users. Its `id` is `auth.uid()` in row-level security policies. */
@@ -56,6 +60,12 @@ export type AppUser = {
   is_anonymous?: boolean;
   /** When the account was created (ISO 8601). */
   created_at?: string;
+  /**
+   * Your own details about the user, from `signUp({ data })` and
+   * {@link AuthClient.updateUser}: a display name, a plan, preferences.
+   * The user can change it, so never base an access decision on it.
+   */
+  user_metadata?: { [key: string]: Json };
   /** Two-factor authentication status. */
   mfa?: {
     /** `'totp'` once an authenticator app is enrolled, otherwise `null`. */
@@ -243,17 +253,33 @@ export interface AuthClient {
   /**
    * Creates an account and signs it in. Listeners get `'SIGNED_UP'`.
    *
-   * @param credentials - The new user's email and password.
+   * @param credentials - The new user's email and password, and `data`: your own details about the user (a JSON object of at most 4 KB), kept as `user.user_metadata`.
    * @returns The new session, also kept by the client.
    * @throws {@link PlexivoError} when the server refuses, for example because the email is taken.
    *
    * @example
    * ```ts
-   * const session = await db.auth.signUp({ email: 'asha@example.com', password });
-   * console.log(session.user.id);
+   * const session = await db.auth.signUp({ email: 'asha@example.com', password, data: { display_name: 'Asha' } });
+   * console.log(session.user.id, session.user.user_metadata);
    * ```
    */
   signUp(credentials: Credentials): Promise<Session>;
+  /**
+   * Changes the signed-in user's `user_metadata`: `data` is merged into it,
+   * and a key set to `null` is removed. The kept session's user is updated
+   * and listeners get `'USER_UPDATED'`.
+   *
+   * @param input - `data`: the keys to set (or remove, with `null`).
+   * @returns The updated user.
+   * @throws TypeError when `data` is not an object.
+   * @throws {@link PlexivoError} coded `sign_in_required` when signed out, or when the server refuses (more than 4 KB, say).
+   *
+   * @example
+   * ```ts
+   * const user = await db.auth.updateUser({ data: { theme: 'dark', beta: null } });
+   * ```
+   */
+  updateUser(input: { data: { [key: string]: Json } }): Promise<AppUser>;
   /**
    * Signs in with an email and password. Listeners get `'SIGNED_IN'`.
    *
@@ -522,6 +548,22 @@ export type Result<T> = T[] & {
   readonly error: null;
 };
 
+/**
+ * A failure, as an awaited query or `rpc()` resolves with
+ * `createClient(url, key, { throwOnError: false })` instead of rejecting.
+ */
+export type Failure = {
+  /** Always `null`. */
+  data: null;
+  /** Always `null`. */
+  count: null;
+  /** What went wrong. */
+  error: PlexivoError;
+};
+
+/** `T`, or a {@link Failure} when the client was created with `throwOnError: false`. */
+export type Outcome<T, Throws extends boolean> = Throws extends false ? T | Failure : T;
+
 /** One row from {@link QueryBuilder.single} or {@link QueryBuilder.maybeSingle}. */
 export type SingleResult<T> = {
   /** The row, or `null` from `maybeSingle()` when nothing matched. */
@@ -542,7 +584,9 @@ export type SingleResult<T> = {
  * - From the client: `missing_where` (an update or delete without a filter),
  *   `multiple_rows` (`sole()`, `single()` or `maybeSingle()` found more than
  *   one), `record_not_found` (see {@link RecordNotFoundError}), `not_found`,
- *   `transaction_already_sent` and `invalid_response`.
+ *   `transaction_already_sent`, `invalid_response`, `aborted` (the request's
+ *   `abortSignal` fired), `network_error` (no answer; the original error is
+ *   `cause`) and `secret_key_in_browser` (from {@link createClient}).
  * - From the server: `unique_violation`, `foreign_key_violation`,
  *   `check_violation`, `permission_denied`, `table_not_exposed`,
  *   `token_expired` and more.
@@ -573,6 +617,7 @@ export class PlexivoError extends Error {
     traceId?: string | null;
     details?: unknown;
     operation?: number;
+    cause?: unknown;
   });
   /** The HTTP status, or `0` when the request was never sent. */
   status: number;
@@ -688,6 +733,21 @@ export type FilterNode =
     value: Json;
   }
   | {
+    /** The column whose value must be among the subquery's. */
+    column: string;
+    /** Always `'in'`; wrap in `not` for NOT IN. */
+    op: 'in';
+    /** The subquery, run as the caller under its table's row-level security. */
+    query: {
+      /** The table. */
+      from: string;
+      /** The one column it returns. */
+      select: string;
+      /** Its filter. */
+      where?: FilterNode;
+    };
+  }
+  | {
     /** A related table that must have a matching row. */
     has: string;
     /** The foreign key constraint to join on, when there is more than one. */
@@ -702,6 +762,15 @@ type Cols<Row> = Extract<keyof Row, string>;
 type Grouper = (q: Conditions<any>) => Conditions<any> | void;
 /** Shapes related rows: gets an {@link EmbedBuilder}, returns it refined. */
 type Related = (q: EmbedBuilder) => EmbedBuilder | void;
+/** A query used as the value of `whereIn` / `whereNotIn`: `db.from('profiles').select('id').where(…)`. */
+export type Subquery = QueryBuilder<any, any, any, any>;
+/** Names the embed (related rows) that `order`, `limit`, `offset` or `range` applies to, as Supabase does. */
+export type EmbedTarget = {
+  /** The embed's name (its alias, or its table). */
+  referencedTable?: string;
+  /** The older name for `referencedTable`. */
+  foreignTable?: string;
+};
 
 /**
  * Filters, alone (for groups) or as part of a query. Every method returns a
@@ -800,17 +869,26 @@ export interface Conditions<Row = Record<string, unknown>> {
    */
   orWhereNot(column: Cols<Row> | (string & {}), op: Operator, value: unknown): this;
   /**
-   * The column is one of the values.
+   * The column is one of the values, or one of a subquery's values (GORM's
+   * `Where("author_id IN (?)", db.Table("profiles").Select("id"))`). The
+   * subquery runs as the caller, under its table's row-level security.
+   *
    * @param column - The column.
-   * @param values - The allowed values.
+   * @param values - The allowed values, or a query selecting one column (the primary key when it selects none).
+   * @throws TypeError when the subquery selects more than one column.
+   *
+   * @example
+   * ```ts
+   * await db.from('posts').whereIn('author_id', db.from('profiles').select('id').where('country', 'IN'));
+   * ```
    */
-  whereIn(column: Cols<Row> | (string & {}), values: unknown[]): this;
+  whereIn(column: Cols<Row> | (string & {}), values: unknown[] | Subquery): this;
   /**
-   * The column is none of the values.
+   * The column is none of the values, or of a subquery's values.
    * @param column - The column.
-   * @param values - The excluded values.
+   * @param values - The excluded values, or a query selecting one column.
    */
-  whereNotIn(column: Cols<Row> | (string & {}), values: unknown[]): this;
+  whereNotIn(column: Cols<Row> | (string & {}), values: unknown[] | Subquery): this;
   /**
    * The column is null.
    * @param column - The column.
@@ -961,7 +1039,7 @@ export interface Conditions<Row = Record<string, unknown>> {
    * @param column - The column.
    * @param values - The allowed values.
    */
-  in(column: Cols<Row> | (string & {}), values: unknown[]): this;
+  in(column: Cols<Row> | (string & {}), values: unknown[] | Subquery): this;
   /**
    * An array or JSON column contains the value (`@>`).
    * @param column - The column.
@@ -1020,6 +1098,10 @@ export interface Conditions<Row = Record<string, unknown>> {
 export type OrderTerm = {
   /** The column to sort by (or to aggregate, with `fn`). */
   column?: string;
+  /** Sort by a column of this to-one related table (many-to-one or one-to-one). */
+  relation?: string;
+  /** With `relation`: the foreign key constraint to join on, when there is more than one. */
+  hint?: string;
   /** Sort by an aggregate, after `groupBy()`. */
   fn?: 'count' | 'sum' | 'avg' | 'min' | 'max';
   /** `'asc'` (the default) or `'desc'`. */
@@ -1036,21 +1118,27 @@ export type OrderTerm = {
  * - `order('created_at', { ascending: false, nullsFirst: true })` (Supabase)
  * - `order('count(*)', 'desc')` after `groupBy()`
  * - `order({ column: 'name', dir: 'asc' })`
+ * - `order('profiles.username', 'desc')` or `order('username', { relation: 'profiles' })`:
+ *   by a column of a to-one related row (GORM's `Joins("Author").Order("Author.name")`);
+ *   the relation is a model relation name or a table name
+ * - `order('created_at', { referencedTable: 'comments', ascending: false })`:
+ *   sorts the rows of the `comments` embed instead (Supabase)
  *
- * Throws a `TypeError` for a direction other than `asc` or `desc`.
+ * Throws a `TypeError` for a direction other than `asc` or `desc`, or for a
+ * `referencedTable` the query does not select or preload.
  */
 type OrderMethod<B> = {
   /**
-   * @param column - The column, optionally with the direction: `'created_at desc'`.
+   * @param column - The column, optionally with the direction: `'created_at desc'`; `'relation.column'` for a related row's column.
    * @param dir - `'asc'` (the default) or `'desc'`.
-   * @param options - Where nulls go.
+   * @param options - Where nulls go; `relation` (and `hint`) for a related row's column; `referencedTable` to sort an embed's rows.
    */
-  (column: string, dir?: 'asc' | 'desc', options?: { nulls?: 'first' | 'last' }): B;
+  (column: string, dir?: 'asc' | 'desc', options?: { nulls?: 'first' | 'last'; relation?: string; hint?: string } & EmbedTarget): B;
   /**
    * @param column - The column.
-   * @param options - Supabase's form: `ascending` and `nullsFirst`.
+   * @param options - Supabase's form: `ascending` and `nullsFirst`, `referencedTable`; and `relation` (with `hint`) for a related row's column.
    */
-  (column: string, options: { ascending?: boolean; nullsFirst?: boolean }): B;
+  (column: string, options: { ascending?: boolean; nullsFirst?: boolean; relation?: string; hint?: string } & EmbedTarget): B;
   /** @param term - The term, as the Data API takes it. */
   (term: OrderTerm): B;
 };
@@ -1071,19 +1159,31 @@ export interface EmbedBuilder extends Conditions<any> {
   /** Same as `order`. */
   orderBy: OrderMethod<this>;
   /**
+   * Newest related rows first.
+   * @param column - The column to sort by. `created_at` when left out.
+   */
+  latest(column?: string): this;
+  /**
+   * Oldest related rows first.
+   * @param column - The column to sort by. `created_at` when left out.
+   */
+  oldest(column?: string): this;
+  /**
    * At most `n` related rows per parent row.
    * @param n - The maximum.
+   * @param options - `referencedTable`: limit a nested embed's rows instead.
    */
-  limit(n: number): this;
+  limit(n: number, options?: EmbedTarget): this;
   /**
    * Skips the first `n` related rows.
    * @param n - How many to skip.
+   * @param options - `referencedTable`: skip a nested embed's rows instead.
    */
-  offset(n: number): this;
+  offset(n: number, options?: EmbedTarget): this;
   /**
-   * Loads a nested relation.
-   * @param relation - A relation name, or a related table name.
-   * @param callback - Shapes the nested rows.
+   * Loads a nested relation, or a path of them: `preload('author.profile')`.
+   * @param relation - A relation name, a related table name, or a dotted path of them.
+   * @param callback - Shapes the nested rows (the last relation on a path).
    */
   preload(relation: string, callback?: Related): this;
   /**
@@ -1176,20 +1276,33 @@ export type AggregateResult = {
  * await db.from('products').where('sku', 'B2').decrement('stock');
  * ```
  */
-export interface QueryBuilder<Row = Record<string, unknown>, Insert = Partial<Row>, Update = Partial<Row>>
-  extends Conditions<Row>, PromiseLike<Result<Row>> {
+export interface QueryBuilder<Row = Record<string, unknown>, Insert = Partial<Row>, Update = Partial<Row>, Throws extends boolean = true>
+  extends Conditions<Row>, PromiseLike<Outcome<Result<Row>, Throws>> {
   /** The table this builder queries. */
   readonly table: string;
   /**
    * Runs the builder and handles a failure.
    * @param onrejected - Called with the error.
    */
-  catch<T = never>(onrejected?: (reason: any) => T | PromiseLike<T>): Promise<Result<Row> | T>;
+  catch<T = never>(onrejected?: (reason: any) => T | PromiseLike<T>): Promise<Outcome<Result<Row>, Throws> | T>;
   /**
    * Runs the builder and calls `onfinally` when it settles.
    * @param onfinally - Called on success or failure.
    */
-  finally(onfinally?: () => void): Promise<Result<Row>>;
+  finally(onfinally?: () => void): Promise<Outcome<Result<Row>, Throws>>;
+  /**
+   * Cancels the request when `signal` aborts; it then fails with a
+   * {@link PlexivoError} coded `aborted`.
+   * @param signal - An `AbortController`'s signal.
+   *
+   * @example
+   * ```ts
+   * const controller = new AbortController();
+   * setTimeout(() => controller.abort(), 5000);
+   * const rows = await db.from('posts').abortSignal(controller.signal);
+   * ```
+   */
+  abortSignal(signal: AbortSignal): this;
   // shaping
   /**
    * The columns to return, and related rows in Supabase's syntax. Pass
@@ -1217,13 +1330,15 @@ export interface QueryBuilder<Row = Record<string, unknown>, Insert = Partial<Ro
   /**
    * At most `n` rows.
    * @param n - The maximum (the server returns at most 1,000 per request).
+   * @param options - `referencedTable`: at most `n` rows of that embed per row instead.
    */
-  limit(n: number): this;
+  limit(n: number, options?: EmbedTarget): this;
   /**
    * Skips the first `n` rows.
    * @param n - How many to skip.
+   * @param options - `referencedTable`: skip that embed's rows instead.
    */
-  offset(n: number): this;
+  offset(n: number, options?: EmbedTarget): this;
   /**
    * One page of rows: sets `limit` and `offset`.
    * @param number - The page, from 1.
@@ -1247,7 +1362,11 @@ export interface QueryBuilder<Row = Record<string, unknown>, Insert = Partial<Ro
    * A belongs-to or has-one relation gives an object (or `null`); has-many
    * and many-to-many give an array.
    *
-   * @param relation - A relation name from the model, or a related table name (`'authors!posts_author_id_fkey'` to pick a foreign key).
+   * A dotted path loads nested relations (GORM's `Preload("Comments.Author")`):
+   * `preload('comments.author')`; the callback shapes the last relation on
+   * the path, and a path merges into a preload of its first relation.
+   *
+   * @param relation - A relation name from the model, a related table name (`'authors!posts_author_id_fkey'` to pick a foreign key), or a dotted path of them.
    * @param callback - Shapes the related rows.
    */
   preload(relation: string, callback?: Related): this;
@@ -1343,12 +1462,12 @@ export interface QueryBuilder<Row = Record<string, unknown>, Insert = Partial<Ro
    * Rejects with {@link RecordNotFoundError} when none match, and with a
    * {@link PlexivoError} coded `multiple_rows` when several do.
    */
-  single(): PromiseLike<SingleResult<Row>>;
+  single(): PromiseLike<Outcome<SingleResult<Row>, Throws>>;
   /**
    * One row or `{ data: null }`.
    * Rejects with a {@link PlexivoError} coded `multiple_rows` when several match.
    */
-  maybeSingle(): PromiseLike<SingleResult<Row>>;
+  maybeSingle(): PromiseLike<Outcome<SingleResult<Row>, Throws>>;
   /**
    * What a write returns: `'representation'` (the default) for the rows,
    * `'minimal'` for only the count.
@@ -1516,7 +1635,7 @@ export interface QueryBuilder<Row = Record<string, unknown>, Insert = Partial<Ro
    * @param values - A row or rows.
    * @param options - `returning: 'minimal'` for only the count.
    */
-  insert(values: Insert | Insert[], options?: { returning?: 'minimal' }): QueryBuilder<Row, Insert, Update>;
+  insert(values: Insert | Insert[], options?: { returning?: 'minimal' }): QueryBuilder<Row, Insert, Update, Throws>;
   /**
    * Inserts, or on conflict updates: `upsert(rows, { onConflict: ['sku'], update: ['price'] })`.
    * Await it for the rows. Runs `beforeSave` and `afterSave` hooks.
@@ -1524,7 +1643,7 @@ export interface QueryBuilder<Row = Record<string, unknown>, Insert = Partial<Ro
    * @param values - A row or rows.
    * @param options - `onConflict`: the unique columns (the primary key when left out); `update`: the columns to update (all when left out), or `false` to leave the existing row untouched; `ignore` or `ignoreDuplicates`: same as `update: false`; `returning: 'minimal'` for only the count.
    */
-  upsert(values: Insert | Insert[], options?: { onConflict?: string | string[]; update?: string[] | false; ignore?: boolean; ignoreDuplicates?: boolean; returning?: 'minimal' }): QueryBuilder<Row, Insert, Update>;
+  upsert(values: Insert | Insert[], options?: { onConflict?: string | string[]; update?: string[] | false; ignore?: boolean; ignoreDuplicates?: boolean; returning?: 'minimal' }): QueryBuilder<Row, Insert, Update, Throws>;
   /**
    * GORM's Save: inserts a row without a primary key; otherwise inserts or
    * updates every column it carries.
@@ -1551,13 +1670,13 @@ export interface QueryBuilder<Row = Record<string, unknown>, Insert = Partial<Ro
    * @param _ - Leave out.
    * @param options - `returning: 'minimal'` for only the count.
    */
-  update(values: Update, _?: undefined, options?: { returning?: 'minimal' }): QueryBuilder<Row, Insert, Update>;
+  update(values: Update, _?: undefined, options?: { returning?: 'minimal' }): QueryBuilder<Row, Insert, Update, Throws>;
   /**
    * Updates one column of the matching rows: `updateColumn('status', 'archived')`. A filter is required.
    * @param column - The column.
    * @param value - Its new value.
    */
-  updateColumn(column: string, value: unknown): QueryBuilder<Row, Insert, Update>;
+  updateColumn(column: string, value: unknown): QueryBuilder<Row, Insert, Update, Throws>;
   /**
    * Adds to a counter in the database, atomically: `increment('views')`.
    * A filter is required; rejects with `missing_where` without one.
@@ -1593,7 +1712,7 @@ export interface QueryBuilder<Row = Record<string, unknown>, Insert = Partial<Ro
    *
    * @param options - `returning: 'minimal'` for only the count.
    */
-  delete(options?: { returning?: 'minimal' }): QueryBuilder<Row, Insert, Update>;
+  delete(options?: { returning?: 'minimal' }): QueryBuilder<Row, Insert, Update, Throws>;
   /** Deletes the matching rows for good, even with a soft-delete column. A filter is required. */
   forceDelete(): Promise<Result<Row>>;
   /**
@@ -1949,6 +2068,13 @@ export interface TransactionClient<TDatabase extends DatabaseDefinition = Defaul
    * @param table - The table name.
    */
   table<TName extends TableName<TDatabase>>(table: TName): TxQueryBuilder<RowOf<TDatabase, TName>, InsertOf<TDatabase, TName>, UpdateOf<TDatabase, TName>>;
+  /**
+   * Records a database function call into the transaction.
+   * @param fn - The function name.
+   * @param args - Its arguments, by name (values may hold refs).
+   * @returns A handle resolving to `{ data, count, error: null }`.
+   */
+  rpc<T = any>(fn: string, args?: Record<string, unknown>): TxHandle<{ data: T; count: number | null; error: null }>;
 }
 /** Values whose columns may also be a {@link Ref} to an earlier operation's result. */
 export type WithRefs<T> = { [K in keyof T]: T[K] | Ref };
@@ -2268,6 +2394,9 @@ export interface Migrator {
 
 // ── realtime, storage, GraphQL, functions ──────────────────────────────────
 
+/** A realtime channel's status, as {@link RealtimeChannel.onStatus} reports it. */
+export type ChannelStatus = 'SUBSCRIBED' | 'RECONNECTING' | 'CHANNEL_ERROR' | 'CLOSED';
+
 /** A row change from a `changes:<table>` channel. */
 export type Change<T = Record<string, unknown>> = {
   /** What happened. */
@@ -2282,7 +2411,10 @@ export type Change<T = Record<string, unknown>> = {
 
 /**
  * A realtime channel. Add listeners, then `subscribe()` to connect. It
- * reconnects on its own until you `unsubscribe()`.
+ * stays joined until you `unsubscribe()`: when the connection drops or the
+ * server ends the channel (an expired session, a restart), it refreshes the
+ * session if needed and joins again, with backoff. A refused join is
+ * reported (`onError`, `onStatus`, `ready()`) and not retried.
  *
  * @example
  * ```ts
@@ -2324,6 +2456,18 @@ export interface RealtimeChannel<T = Record<string, unknown>> {
    */
   onError(listener: (error: Error & { code?: string }) => void): RealtimeChannel<T>;
   /**
+   * The channel's status: `'SUBSCRIBED'` on every join (and rejoin),
+   * `'RECONNECTING'` when the connection dropped or the server ended the
+   * channel (it joins again by itself), `'CHANNEL_ERROR'` when a join was
+   * refused (not retried) and `'CLOSED'` after `unsubscribe()`.
+   * @param listener - Gets the status, and the error for `'CHANNEL_ERROR'`.
+   */
+  onStatus(listener: (status: ChannelStatus, error?: PlexivoError) => void): RealtimeChannel<T>;
+  /** Where the channel is now: `'connecting'`, `'joined'`, `'reconnecting'`, `'refused'` or `'closed'`. */
+  readonly state: 'connecting' | 'joined' | 'reconnecting' | 'refused' | 'closed';
+  /** `true` while joined. */
+  readonly joined: boolean;
+  /**
    * One listener for any event: `'change'`, `'presence'`, `'error'`, or a broadcast event name.
    * @param event - The event.
    * @param listener - The listener.
@@ -2341,8 +2485,11 @@ export interface RealtimeChannel<T = Record<string, unknown>> {
    * @throws PlexivoError (rejects) when the server refuses the join, with `code` such as `table_not_exposed` or `sign_in_required`.
    */
   ready(): Promise<void>;
-  /** Connects and joins. Calling it again does nothing. */
-  subscribe(): RealtimeChannel<T>;
+  /**
+   * Connects and joins. Calling it again does nothing (beyond adding `callback`).
+   * @param callback - Gets each status, as {@link RealtimeChannel.onStatus} does.
+   */
+  subscribe(callback?: (status: ChannelStatus, error?: PlexivoError) => void): RealtimeChannel<T>;
   /** Leaves, disconnects and removes the listeners. */
   unsubscribe(): void;
 }
@@ -2617,6 +2764,99 @@ type InsertOf<D extends DatabaseDefinition, T extends TableName<D>> = D['public'
 /** A table's `Update` type. */
 type UpdateOf<D extends DatabaseDefinition, T extends TableName<D>> = D['public']['Tables'][T]['Update'];
 /** The database type's functions, or any function when it has none. */
+/** What an `rpc()` call resolves to. */
+export type RpcResult<T> = {
+  /** What the function returned: its rows, or its value. */
+  data: T;
+  /** The total number of rows with `{ count: 'exact' }`; otherwise `null`. */
+  count: number | null;
+  /** Always `null`. Failures reject with a {@link PlexivoError} (or resolve as a {@link Failure} with `throwOnError: false`). */
+  error: null;
+};
+
+/**
+ * A database function call, from {@link PlexivoClient.rpc}. Await it as it
+ * is for what the function returns. For a function that returns rows
+ * (`RETURNS SETOF <table>` or `RETURNS TABLE (…)`), chain a query on its
+ * result first: columns (and, for `SETOF` an exposed table, embeds through
+ * that table's foreign keys), filters, order, limit, range, `single()` or
+ * `maybeSingle()`, and a count with `rpc(fn, args, { count: 'exact' })`.
+ *
+ * @example
+ * ```ts
+ * const { data, count } = await db.rpc('search_posts', { q: 'postgres' }, { count: 'exact' })
+ *   .select('id, title, author:profiles(username)')
+ *   .gte('likes', 10)
+ *   .order('created_at', { ascending: false })
+ *   .range(0, 9);
+ * ```
+ */
+export interface RpcBuilder<T = unknown, Throws extends boolean = true> extends Conditions<T extends Array<infer R> ? (R extends Record<string, unknown> ? R : Record<string, unknown>) : Record<string, unknown>>, PromiseLike<Outcome<RpcResult<T>, Throws>> {
+  /** The function name. */
+  readonly fn: string;
+  /**
+   * The columns of the returned rows, and related rows in Supabase's syntax.
+   * @param columns - Column names, `'a, b'`, `'author:profiles(username)'`; `{ count: 'exact' }` last for the total.
+   */
+  select(...columns: Array<string | string[] | Record<string, string> | { count?: 'exact'; head?: boolean }>): this;
+  /** Sorts the returned rows. See {@link OrderMethod}. */
+  order: OrderMethod<this>;
+  /** Same as `order`. */
+  orderBy: OrderMethod<this>;
+  /**
+   * At most `n` rows.
+   * @param n - The maximum.
+   * @param options - `referencedTable`: limit an embed's rows instead.
+   */
+  limit(n: number, options?: EmbedTarget): this;
+  /**
+   * Skips the first `n` rows.
+   * @param n - How many to skip.
+   * @param options - `referencedTable`: for an embed's rows instead.
+   */
+  offset(n: number, options?: EmbedTarget): this;
+  /**
+   * Rows `from` to `to`, inclusive and zero-based.
+   * @param from - The first row.
+   * @param to - The last row.
+   * @param options - `referencedTable`: for an embed's rows instead.
+   */
+  range(from: number, to: number, options?: EmbedTarget): this;
+  /**
+   * Related rows of the returned rows (a `SETOF` exposed table only).
+   * @param relation - A related table name, or a dotted path.
+   * @param callback - Shapes the related rows.
+   */
+  preload(relation: string, callback?: Related): this;
+  /**
+   * Like `preload`, keeping only rows with a matching related row.
+   * @param relation - A related table name.
+   * @param callback - Shapes and filters the related rows.
+   */
+  joins(relation: string, callback?: Related): this;
+  /** Exactly one row as `data`; rejects with {@link RecordNotFoundError} for none and `multiple_rows` for several. */
+  single(): PromiseLike<Outcome<RpcResult<T extends Array<infer R> ? R : T>, Throws>>;
+  /** One row or `data: null`; rejects with `multiple_rows` for several. */
+  maybeSingle(): PromiseLike<Outcome<RpcResult<(T extends Array<infer R> ? R : T) | null>, Throws>>;
+  /**
+   * Cancels the request when `signal` aborts.
+   * @param signal - An `AbortController`'s signal.
+   */
+  abortSignal(signal: AbortSignal): this;
+  /** The structured call this builder sends (`{ op: 'rpc', … }`), without running it. */
+  toQuery(): Record<string, unknown>;
+  /**
+   * Runs the call and handles a failure.
+   * @param onrejected - Called with the error.
+   */
+  catch<R = never>(onrejected?: (reason: any) => R | PromiseLike<R>): Promise<Outcome<RpcResult<T>, Throws> | R>;
+  /**
+   * Runs the call and calls `onfinally` when it settles.
+   * @param onfinally - Called on success or failure.
+   */
+  finally(onfinally?: () => void): Promise<Outcome<RpcResult<T>, Throws>>;
+}
+
 type Functions<D extends DatabaseDefinition> = D['public'] extends {
   /** The functions. */
   Functions: infer F;
@@ -2635,7 +2875,7 @@ type Functions<D extends DatabaseDefinition> = D['public'] extends {
  * secret key, on a server only, it can also run raw SQL, migrations and user
  * imports.
  */
-export interface PlexivoClient<TDatabase extends DatabaseDefinition = DefaultDatabase> {
+export interface PlexivoClient<TDatabase extends DatabaseDefinition = DefaultDatabase, Throws extends boolean = true> {
   /** The project URL the client talks to, without a trailing slash. */
   readonly apiUrl: string;
   /** The trace id of the last response, to quote to support. */
@@ -2664,12 +2904,12 @@ export interface PlexivoClient<TDatabase extends DatabaseDefinition = DefaultDat
    * const { data, count } = await db.from('notes').select('id, body', { count: 'exact' }).eq('pinned', true);
    * ```
    */
-  from<TName extends TableName<TDatabase>>(table: TName): QueryBuilder<RowOf<TDatabase, TName>, InsertOf<TDatabase, TName>, UpdateOf<TDatabase, TName>>;
+  from<TName extends TableName<TDatabase>>(table: TName): QueryBuilder<RowOf<TDatabase, TName>, InsertOf<TDatabase, TName>, UpdateOf<TDatabase, TName>, Throws>;
   /**
    * Same as {@link PlexivoClient.from}.
    * @param table - The table name.
    */
-  table<TName extends TableName<TDatabase>>(table: TName): QueryBuilder<RowOf<TDatabase, TName>, InsertOf<TDatabase, TName>, UpdateOf<TDatabase, TName>>;
+  table<TName extends TableName<TDatabase>>(table: TName): QueryBuilder<RowOf<TDatabase, TName>, InsertOf<TDatabase, TName>, UpdateOf<TDatabase, TName>, Throws>;
   /**
    * Defines a model: what GORM learns from a struct, said once. Relations,
    * hooks, scopes, soft deletes, and columns for migrations. From then on,
@@ -2728,28 +2968,25 @@ export interface PlexivoClient<TDatabase extends DatabaseDefinition = DefaultDat
   transaction(callback: (tx: TransactionClient<TDatabase>) => unknown): Promise<any[]>;
   /**
    * Calls a database function exposed with `COMMENT ON FUNCTION … IS '@expose'`.
+   * Await it as it is, or, for a function that returns rows, chain a query
+   * on its result first (see {@link RpcBuilder}).
    *
    * @param fn - The function name.
    * @param args - Its arguments, by name.
-   * @returns `{ data, count, error: null }`.
-   * @throws {@link PlexivoError} when the call fails.
+   * @param options - `count: 'exact'` for the total number of rows; `head: true` for the count alone.
+   * @returns A builder resolving to `{ data, count, error: null }`.
+   * @throws {@link PlexivoError} (rejects) when the call fails: `function_not_exposed`, a database error, …
    *
    * @example
    * ```ts
-   * const { data } = await db.rpc('note_count', { owner: userId });
+   * const { data: total } = await db.rpc('note_count', { owner: userId });
+   * const { data: hits } = await db.rpc('search_posts', { q: 'postgres' }).select('id, title').order('id').limit(10);
    * ```
    */
-  rpc<TName extends keyof Functions<TDatabase> & string>(fn: TName, args?: Record<string, unknown>): Promise<{
-    /** What the function returned. */
-    data: Functions<TDatabase>[TName] extends {
-      /** The function's return type. */
-      Returns: infer R;
-    } ? R : unknown;
-    /** How many rows, for a function that returns a set; otherwise `null`. */
-    count: number | null;
-    /** Always `null`. Failures reject with a {@link PlexivoError} instead. */
-    error: null;
-  }>;
+  rpc<TName extends keyof Functions<TDatabase> & string>(fn: TName, args?: Record<string, unknown>, options?: { count?: 'exact'; head?: boolean }): RpcBuilder<Functions<TDatabase>[TName] extends {
+    /** The function's return type. */
+    Returns: infer R;
+  } ? R : unknown, Throws>;
   /** GraphQL queries, mutations and live queries on your schema. See {@link GraphQLClient}. */
   graphql: GraphQLClient;
   /** Plexivo Functions: your server-side code beside the data. */
@@ -2905,6 +3142,33 @@ export interface PlexivoClient<TDatabase extends DatabaseDefinition = DefaultDat
   rollback(migrations: Migration[], options?: { steps?: number; table?: string }): Promise<string[]>;
 }
 
+/** Options for {@link createClient}. */
+export type ClientOptions = {
+  /** A Fetch API implementation (the global one when left out); also how to add headers to every request. */
+  fetch?: typeof fetch;
+  /** A WebSocket implementation for realtime, where there is no global one. */
+  WebSocket?: typeof WebSocket;
+  /** A session to start with. */
+  initialSession?: Session;
+  /** `false` keeps the session in memory only (use it on a server). */
+  persistSession?: boolean;
+  /** The storage key for the session. */
+  storageKey?: string;
+  /** Where the session is kept: `localStorage` in a browser; an encrypted store in React Native. */
+  storage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+  /** An id sent when joining realtime channels. */
+  realtimeClientId?: string;
+  /** How often realtime checks the connection is alive, in milliseconds (25,000 when left out). */
+  realtimeHeartbeatMs?: number;
+  /**
+   * `false`: an awaited query or `rpc()` that fails resolves as
+   * `{ data: null, count: null, error }` (a {@link Failure}) instead of
+   * rejecting, as Supabase does. Terminal methods such as `first()`,
+   * `find()` and `create()` still reject. `true` (the default) rejects.
+   */
+  throwOnError?: boolean;
+};
+
 /**
  * Creates a client for one Plexivo Postgres project.
  *
@@ -2919,8 +3183,9 @@ export interface PlexivoClient<TDatabase extends DatabaseDefinition = DefaultDat
  * @typeParam TDatabase - Your generated database type, for typed tables, columns and functions.
  * @param apiUrl - The project's data URL.
  * @param key - The publishable key, or the secret key on a server.
- * @param options - `fetch`: a Fetch API implementation (the global one when left out); `WebSocket`: for realtime outside a browser; `initialSession`: a session to start with; `persistSession`: `false` to keep the session in memory only; `storageKey`: the storage key for the session; `storage`: where the session is kept (`localStorage` in a browser); `realtimeClientId`: an id sent when joining realtime channels.
+ * @param options - See {@link ClientOptions}: `fetch`, `WebSocket`, `initialSession`, `persistSession`, `storageKey`, `storage`, `realtimeClientId`, `realtimeHeartbeatMs` and `throwOnError`.
  * @throws Error without `apiUrl` or `key`, or when there is no Fetch API.
+ * @throws {@link PlexivoError} coded `secret_key_in_browser` for the secret key in a browser or web worker.
  *
  * @example In an app
  * ```ts
@@ -2940,12 +3205,15 @@ export interface PlexivoClient<TDatabase extends DatabaseDefinition = DefaultDat
  * });
  * ```
  */
-export function createClient<TDatabase extends DatabaseDefinition = DefaultDatabase>(apiUrl: string, key: string, options?: {
-  fetch?: typeof fetch;
-  WebSocket?: typeof WebSocket;
-  initialSession?: Session;
-  persistSession?: boolean;
-  storageKey?: string;
-  storage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
-  realtimeClientId?: string;
-}): PlexivoClient<TDatabase>;
+export function createClient<TDatabase extends DatabaseDefinition = DefaultDatabase>(apiUrl: string, key: string, options: ClientOptions & { throwOnError: false }): PlexivoClient<TDatabase, false>;
+export function createClient<TDatabase extends DatabaseDefinition = DefaultDatabase>(apiUrl: string, key: string, options?: ClientOptions): PlexivoClient<TDatabase>;
+
+/** The version of this package, such as `'0.4.0'`. */
+export const VERSION: string;
+
+/**
+ * The {@link RpcBuilder} class, for `instanceof` checks.
+ */
+export const RpcBuilder: {
+  prototype: RpcBuilder<unknown, boolean>;
+};

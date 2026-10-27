@@ -1,14 +1,27 @@
 import {apiError, PlexivoError, RecordNotFoundError, isNotFound, isUniqueViolation, isPermissionDenied} from './errors.js';
-import {QueryBuilder, Conditions} from './query.js';
+import {QueryBuilder, Conditions, RpcBuilder} from './query.js';
 import {tableContext, defineModel, belongsTo, hasOne, hasMany, manyToMany} from './model.js';
 import {sqlApi} from './sql.js';
 
-export {PlexivoError, RecordNotFoundError, isNotFound, isUniqueViolation, isPermissionDenied, belongsTo, hasOne, hasMany, manyToMany, QueryBuilder, Conditions};
+export {PlexivoError, RecordNotFoundError, isNotFound, isUniqueViolation, isPermissionDenied, belongsTo, hasOne, hasMany, manyToMany, QueryBuilder, Conditions, RpcBuilder};
+
+/** The version of this package. */
+export const VERSION = '0.4.0';
 
 const trimSlash = (value) => value.replace(/\/+$/, '');
 
+// A web page or a web worker: anything there can be read by whoever loads it.
+const inBrowser = () => typeof window !== 'undefined' ||
+  (typeof WorkerGlobalScope !== 'undefined' && typeof self !== 'undefined' && self instanceof WorkerGlobalScope);
+
 export function createClient(apiUrl, publishableKey, options = {}) {
   if (!apiUrl || !publishableKey) throw new Error('apiUrl and publishableKey are required');
+  if (String(publishableKey).startsWith('plx_secret_') && inBrowser()) {
+    throw new PlexivoError(
+      'The secret key is for servers only and must never reach a browser: anyone who opens the page can read it. Use the publishable key here, keep the secret key on your server, and rotate it if it was published.',
+      {code: 'secret_key_in_browser'}
+    );
+  }
 
   const baseUrl = trimSlash(apiUrl);
   const request = options.fetch || globalThis.fetch;
@@ -82,7 +95,12 @@ export function createClient(apiUrl, publishableKey, options = {}) {
       headers.set('authorization', `Bearer ${session.access_token}`);
     }
 
-    const response = await request(`${baseUrl}${path}`, {...init, headers});
+    let response;
+    try {
+      response = await request(`${baseUrl}${path}`, {...init, headers});
+    } catch (error) {
+      throw transportError(error);
+    }
     lastTraceId = response.headers.get('x-trace-id');
     const payload = response.status === 204 ? null : await readJson(response);
     if (!response.ok) {
@@ -108,7 +126,25 @@ export function createClient(apiUrl, publishableKey, options = {}) {
   }
 
   const auth = {
-    signUp: (credentials) => authenticate('/auth/signup', credentials),
+    /**
+     * A new account. `data` (or Supabase's `options.data`) is kept as the
+     * user's `user_metadata`: a JSON object of at most 4 KB.
+     */
+    signUp: ({options: signUpOptions, ...credentials} = {}) => authenticate('/auth/signup', {
+      ...credentials,
+      ...(credentials.data === undefined && signUpOptions?.data !== undefined ? {data: signUpOptions.data} : {})
+    }),
+    /**
+     * Changes the signed-in user's `user_metadata`: `data` is merged in, and
+     * a key set to `null` is removed. Resolves to the updated user.
+     */
+    async updateUser({data} = {}) {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) throw new TypeError('updateUser takes {data: {...}}, an object to merge into user_metadata');
+      const result = await call('/auth/user', {method: 'PATCH', body: JSON.stringify({data})}, true);
+      const user = result?.user ?? result;
+      if (session) setSession({...session, user: {...session.user, ...user}}, 'USER_UPDATED');
+      return user;
+    },
     signInWithPassword: (credentials) => authenticate('/auth/login', credentials),
     getProviders: () => call('/auth/providers'),
     resetPasswordForEmail: (email) => call('/auth/password/recovery', {
@@ -290,11 +326,13 @@ export function createClient(apiUrl, publishableKey, options = {}) {
 
   const models = new Map();
 
-  function dataLayer(send) {
+  function dataLayer(send, deferred = false) {
     const layer = {
       _send: send,
-      _query: (op) => send(() => op, (r) => r, 'raw'),
+      _query: (op, opts) => send(() => op, (r) => r, 'raw', opts),
       _model: (table) => models.get(table),
+      _throwOnError: options.throwOnError !== false,
+      _deferred: deferred,
       /** A query on one table: chain filters, then await it (find) or call a terminal method. */
       from(table) {
         if (typeof table !== 'string' || !table) throw new TypeError('from() takes a table name');
@@ -304,11 +342,33 @@ export function createClient(apiUrl, publishableKey, options = {}) {
     };
     layer.table = layer.from;
     layer.transaction = (callback) => transaction(callback);
+    /**
+     * A database function exposed with COMMENT ON FUNCTION … IS '@expose'.
+     * Awaitable as it is; chain select, filters, order, limit, range,
+     * single or maybeSingle for a function that returns rows.
+     */
+    layer.rpc = (fn, args = {}, rpcOptions = {}) => {
+      if (typeof fn !== 'string' || !fn) throw new TypeError('rpc() takes a function name');
+      if (deferred) {
+        // Inside a transaction: recorded now, like every other operation.
+        return send(() => ({op: 'rpc', function: fn, args}), (r) => ({data: r.data, count: r.count ?? null, error: null}), 'raw');
+      }
+      const ctx = {
+        ...tableContext(layer, fn, {}),
+        fn,
+        args,
+        rpcPlain: (name, body, opts) => call(`/rest/v1/rpc/${encodeURIComponent(name)}`, {method: 'POST', body: JSON.stringify(body), ...(opts?.signal ? {signal: opts.signal} : {})}, 'optional')
+      };
+      let q = new RpcBuilder(ctx);
+      if (rpcOptions.count) q = q._with({count: true});
+      if (rpcOptions.head) q = q._with({head: true});
+      return q;
+    };
     return layer;
   }
 
-  const direct = dataLayer((build, finish) =>
-    Promise.resolve().then(build).then((op) => call('/query/v1', {method: 'POST', body: JSON.stringify(op)}, 'optional')).then(finish));
+  const direct = dataLayer((build, finish, _shape, opts) =>
+    Promise.resolve().then(build).then((op) => call('/query/v1', {method: 'POST', body: JSON.stringify(op), ...(opts?.signal ? {signal: opts.signal} : {})}, 'optional')).then(finish));
 
   /**
    * Several operations that commit together or not at all. Record them on
@@ -347,8 +407,7 @@ export function createClient(apiUrl, publishableKey, options = {}) {
       return handle;
     };
 
-    const tx = dataLayer(send);
-    tx._deferred = true;
+    const tx = dataLayer(send, true);
     let settled = false, failure;
     const running = Promise.resolve().then(() => callback(tx)).then(
       () => { settled = true; },
@@ -390,9 +449,7 @@ export function createClient(apiUrl, publishableKey, options = {}) {
     return finished;
   }
 
-  /** Calls a database function exposed with COMMENT ON FUNCTION … IS '@expose'. */
-  const rpc = (fn, args = {}) => call(`/rest/v1/rpc/${encodeURIComponent(fn)}`, {method: 'POST', body: JSON.stringify(args)}, 'optional')
-    .then((r) => ({data: r.data, count: r.count ?? null, error: null}));
+  const rpc = direct.rpc;
 
   /**
    * A GraphQL query or mutation on your schema: `{data, errors}`, errors as
@@ -468,29 +525,52 @@ export function createClient(apiUrl, publishableKey, options = {}) {
    *                      ('room:private:…' for signed-in users only);
    *   '<table>'          the original per-user starter channel ('items').
    * Works signed out too, where the rows or room allow it.
+   *
+   * The channel stays joined by itself: when the connection drops, or the
+   * server ends the channel (an expired token, a restart), it refreshes the
+   * session if it needs to and joins again, with backoff. A join the server
+   * refuses (an unknown table, a private room while signed out) is reported
+   * to onError / onStatus and ready(), and not retried.
    */
   function channel(topic = 'items', channelOptions = {}) {
-    const full = /^(changes|room):/.test(topic) || topic === 'graphql' ? `realtime:${topic}` : `realtime:${topic}`;
+    const full = `realtime:${topic}`;
     const listeners = new Set();
     const broadcastListeners = new Map();
     const presenceListeners = new Set();
     const graphqlListeners = new Map();
-    const joinCallbacks = [];
-    const refusalCallbacks = [];
+    const errorListeners = new Set();
+    const statusListeners = new Set();
+    const joinHooks = new Set();
+    const refusalHooks = new Set();
+    let readyWaiters = [];
     const replies = new Map();
-    let socket;
-    let heartbeat;
-    let reconnectTimer;
+    const heartbeatMs = options.realtimeHeartbeatMs || 25_000;
+    let socket = null;
+    let socketToken = null;
+    let heartbeat = null;
+    let pendingHeartbeat = null;
+    let reconnectTimer = null;
+    let expiryTimer = null;
     let reconnectAttempt = 0;
+    let joinedAt = 0;
     let active = false;
     let joined = false;
+    let refused = null;
+    let state = 'closed';
     let ref = 1;
 
-    const clearTimers = () => {
-      if (heartbeat) clearInterval(heartbeat);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      heartbeat = null;
-      reconnectTimer = null;
+    const STATUS = {joined: 'SUBSCRIBED', reconnecting: 'RECONNECTING', refused: 'CHANNEL_ERROR', closed: 'CLOSED'};
+    const setState = (next, error) => {
+      if (state === next && next !== 'refused') return;
+      state = next;
+      for (const fn of statusListeners) {
+        try { fn(STATUS[next], error); } catch { /* listeners are isolated */ }
+      }
+    };
+    const report = (error) => {
+      for (const fn of errorListeners) {
+        try { fn(error); } catch { /* listeners are isolated */ }
+      }
     };
 
     const send = (event, payload, topicName = full) => {
@@ -501,12 +581,90 @@ export function createClient(apiUrl, publishableKey, options = {}) {
     };
     const push = (event, payload) => new Promise((resolve, reject) => {
       const r = send(event, payload);
-      if (!r) return reject(new Error('Realtime channel is not connected'));
+      if (!r) return reject(new PlexivoError('Realtime channel is not connected', {code: 'not_connected'}));
       replies.set(r, resolve);
-      setTimeout(() => { if (replies.delete(r)) reject(new Error('Realtime reply timed out')); }, 10_000);
+      setTimeout(() => { if (replies.delete(r)) reject(new PlexivoError('Realtime reply timed out', {code: 'timeout'})); }, 10_000);
     });
 
-    const connect = () => {
+    // Closes this connection now; its late events are ignored.
+    const drop = () => {
+      const ws = socket;
+      socket = null;
+      joined = false;
+      if (heartbeat) clearInterval(heartbeat);
+      if (expiryTimer) clearTimeout(expiryTimer);
+      heartbeat = null;
+      expiryTimer = null;
+      pendingHeartbeat = null;
+      replies.clear();
+      if (ws) {
+        try { ws.close(); } catch { /* already closed */ }
+      }
+    };
+
+    const reconnect = (immediate = false) => {
+      if (!active || reconnectTimer) return;
+      // A connection that stayed up a while starts the backoff again.
+      if (joinedAt && Date.now() - joinedAt > 30_000) reconnectAttempt = 0;
+      joinedAt = 0;
+      const attempt = reconnectAttempt++;
+      const delay = immediate && attempt === 0 ? 0 : Math.min(500 * (2 ** attempt), 15_000) * (0.8 + Math.random() * 0.4);
+      setState('reconnecting');
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
+    };
+
+    const refuse = (error) => {
+      refused = error;
+      active = false;
+      drop();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      setState('refused', error);
+      for (const w of readyWaiters) w.reject(error);
+      readyWaiters = [];
+      for (const fn of refusalHooks) fn(error);
+      report(error);
+    };
+
+    // Refreshes the session shortly before the token the channel joined with
+    // expires, so the channel moves to the new token without missing a change.
+    const watchExpiry = (token) => {
+      const claims = tokenClaims(token);
+      if (!claims?.exp) return;
+      const life = claims.iat ? (claims.exp - claims.iat) * 1000 : 3_600_000;
+      const margin = Math.min(60_000, Math.max(1_000, life * 0.2));
+      const wait = Math.max(0, claims.exp * 1000 - Date.now() - margin);
+      expiryTimer = setTimeout(() => {
+        expiryTimer = null;
+        if (!active || socketToken !== token) return;
+        if (session?.access_token === token && session?.refresh_token) refreshExpiredSession().catch(() => {});
+        else onAuth();
+      }, Math.min(wait, 2_147_000_000));
+    };
+
+    // A new session (refreshed, signed in or out): join again with it.
+    const onAuth = () => {
+      if (!active || reconnectTimer) return;
+      const token = session?.access_token || null;
+      if (token === socketToken || (!socket && !joined)) return;
+      drop();
+      reconnectAttempt = 0;
+      reconnect(true);
+    };
+
+    const connect = async () => {
+      if (!active) return;
+      // The socket checks the token when it connects: refresh one that has expired or is about to.
+      if (session?.access_token && session?.refresh_token && expiresWithin(session.access_token, 5)) {
+        try {
+          await refreshExpiredSession();
+        } catch (error) {
+          if (!active) return;
+          if (error?.status >= 400 && error?.status < 500) return refuse(error);
+          return reconnect();
+        }
+      }
+      if (!active || socket) return;
       const parsed = new URL(baseUrl);
       const project = parsed.pathname.split('/').filter(Boolean).at(-1);
       const protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -514,31 +672,56 @@ export function createClient(apiUrl, publishableKey, options = {}) {
       socketUrl.searchParams.set('vsn', '2.0.0');
       socketUrl.searchParams.set('project', project);
       socketUrl.searchParams.set('apikey', publishableKey);
-      if (session?.access_token) socketUrl.searchParams.set('access_token', session.access_token);
-      socket = new (options.WebSocket || globalThis.WebSocket)(socketUrl);
-      socket.addEventListener('open', () => {
-        reconnectAttempt = 0;
+      const token = session?.access_token || null;
+      if (token) socketUrl.searchParams.set('access_token', token);
+      const ws = new (options.WebSocket || globalThis.WebSocket)(socketUrl.toString());
+      socket = ws;
+      socketToken = token;
+
+      ws.addEventListener('open', () => {
+        if (ws !== socket) return;
         const params = {client_id: options.realtimeClientId, ...(channelOptions.filter ? {filter: channelOptions.filter} : {}), ...(channelOptions.presence ? {presence: channelOptions.presence} : {})};
         const r = send('phx_join', params);
         replies.set(r, (reply) => {
+          if (ws !== socket) return;
           if (reply.status === 'ok') {
             joined = true;
-            refusalCallbacks.length = 0;
-            joinCallbacks.splice(0).forEach((fn) => fn());
+            joinedAt = Date.now();
+            refused = null;
+            setState('joined');
+            for (const w of readyWaiters) w.resolve();
+            readyWaiters = [];
+            for (const fn of joinHooks) {
+              try { fn(); } catch { /* isolated */ }
+            }
+            if (token) watchExpiry(token);
           } else {
-            // Refused (table_not_exposed, sign_in_required, …): the error
-            // listeners hear it and ready() rejects rather than waiting forever.
+            // Refused (table_not_exposed, sign_in_required, …): reported, not retried.
             const reason = reply.response?.reason || 'join_refused';
-            const error = new PlexivoError(`Realtime refused to join ${topic}: ${reason}`, {code: reason});
-            joinCallbacks.length = 0;
-            refusalCallbacks.splice(0).forEach((fn) => fn(error));
-            for (const fn of errorListeners) fn(error);
+            refuse(new PlexivoError(`Realtime refused to join ${topic}: ${reason}`, {code: reason, details: reply.response?.message}));
           }
         });
-        heartbeat = setInterval(() => send('heartbeat', {}, 'phoenix'), 25_000);
+        heartbeat = setInterval(() => {
+          if (ws !== socket) return;
+          if (pendingHeartbeat) {
+            // No answer to the last heartbeat: the connection is gone.
+            drop();
+            reconnect();
+            return;
+          }
+          pendingHeartbeat = send('heartbeat', {}, 'phoenix');
+        }, heartbeatMs);
       });
-      socket.addEventListener('message', (event) => {
-        const [, msgRef, msgTopic, name, payload] = JSON.parse(event.data);
+
+      ws.addEventListener('message', (event) => {
+        if (ws !== socket) return;
+        let message;
+        try { message = JSON.parse(event.data); } catch { return; }
+        const [, msgRef, msgTopic, name, payload] = message;
+        if (name === 'phx_reply' && msgRef != null && msgRef === pendingHeartbeat) {
+          pendingHeartbeat = null;
+          return;
+        }
         if (name === 'phx_reply' && replies.has(msgRef)) {
           const resolve = replies.get(msgRef);
           replies.delete(msgRef);
@@ -556,20 +739,22 @@ export function createClient(apiUrl, publishableKey, options = {}) {
         }
         if (name === 'graphql') graphqlListeners.get(payload.id)?.(payload.payload);
         if (name === 'system' && payload?.status === 'token_expired') {
-          for (const fn of errorListeners) fn(Object.assign(new Error('token_expired'), {code: 'token_expired'}));
+          report(new PlexivoError('The session expired; joining again with a fresh one', {code: 'token_expired', status: 401}));
+        }
+        if (name === 'phx_close' || name === 'phx_error') {
+          // The server ended the channel: join again on a fresh connection.
+          drop();
+          reconnect(true);
         }
       });
-      socket.addEventListener('close', () => {
-        clearTimers();
-        joined = false;
-        if (active) {
-          const delay = Math.min(1000 * (2 ** reconnectAttempt++), 10_000);
-          reconnectTimer = setTimeout(connect, delay);
-        }
+
+      ws.addEventListener('close', () => {
+        if (ws !== socket) return;
+        drop();
+        reconnect();
       });
     };
 
-    const errorListeners = new Set();
     const api = {
       /** Row changes: `{type: 'insert' | 'update' | 'delete', table, record, old}`. */
       onChange(listener) {
@@ -595,38 +780,58 @@ export function createClient(apiUrl, publishableKey, options = {}) {
         errorListeners.add(listener);
         return api;
       },
+      /** `SUBSCRIBED` on every join, `RECONNECTING`, `CHANNEL_ERROR` (refused) and `CLOSED`. */
+      onStatus(listener) {
+        statusListeners.add(listener);
+        return api;
+      },
+      /** `'closed'`, `'connecting'`, `'joined'`, `'reconnecting'` or `'refused'`. */
+      get state() { return state; },
+      get joined() { return joined; },
       sendBroadcast(event, payload = {}) {
         if (!send('broadcast', {event, payload})) {
-          throw new Error('Realtime channel is not connected');
+          throw new PlexivoError('Realtime channel is not connected', {code: 'not_connected'});
         }
         return api;
       },
       /** Resolves once the channel has joined; rejects with a PlexivoError when the join is refused. */
       ready: () => new Promise((resolve, reject) => {
         if (joined) return resolve();
-        joinCallbacks.push(resolve);
-        refusalCallbacks.push(reject);
+        if (refused) return reject(refused);
+        readyWaiters.push({resolve, reject});
       }),
-      subscribe() {
+      subscribe(callback) {
+        if (typeof callback === 'function') statusListeners.add(callback);
         if (active) return api;
         active = true;
+        refused = null;
+        authListeners.add(onAuth);
+        state = 'connecting';
         connect();
         return api;
       },
       unsubscribe() {
+        const wasActive = active;
         active = false;
-        clearTimers();
-        socket?.close();
+        authListeners.delete(onAuth);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        drop();
+        if (wasActive) setState('closed');
         listeners.clear();
         broadcastListeners.clear();
         presenceListeners.clear();
         graphqlListeners.clear();
+        statusListeners.clear();
+        joinHooks.clear();
+        refusalHooks.clear();
       },
       _push: push,
+      // Runs on every join (and now, when joined); onRefused hears a refusal.
       _onJoin: (fn, onRefused) => {
-        if (joined) return fn();
-        joinCallbacks.push(fn);
-        if (onRefused) refusalCallbacks.push(onRefused);
+        joinHooks.add(fn);
+        if (onRefused) refusalHooks.add(onRefused);
+        if (joined) fn();
       },
       _onGraphql: (id, fn) => graphqlListeners.set(id, fn)
     };
@@ -665,6 +870,29 @@ export function createClient(apiUrl, publishableKey, options = {}) {
 // A JSON body, or null when there is none or it is not JSON (a proxy's HTML
 // error page, say): a failure must still surface as a PlexivoError with its
 // status, not as a SyntaxError from the parser.
+// A request that never got an answer: aborted by its signal, or a network failure.
+function transportError(error) {
+  if (error instanceof PlexivoError) return error;
+  if (error?.name === 'AbortError') return new PlexivoError('The request was aborted', {code: 'aborted', cause: error});
+  return new PlexivoError(`The Data API could not be reached: ${error?.message || error}`, {code: 'network_error', cause: error});
+}
+
+// The claims of an access token (a JWT), without checking it: only to know when it expires.
+function tokenClaims(token) {
+  try {
+    const part = String(token).split('.')[1];
+    const base64 = part.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(part.length / 4) * 4, '=');
+    return JSON.parse(atob(base64));
+  } catch {
+    return null;
+  }
+}
+
+function expiresWithin(token, seconds) {
+  const exp = tokenClaims(token)?.exp;
+  return typeof exp === 'number' && exp * 1000 - Date.now() < seconds * 1000;
+}
+
 async function readJson(response) {
   const text = await response.text();
   if (text === '') return null;

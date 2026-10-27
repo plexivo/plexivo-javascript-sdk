@@ -132,11 +132,18 @@ export function condition(args, ctx) {
   }
   if (typeof a !== 'string' || a === '') throw new TypeError('where() takes a column, an object or a function');
   if (args.length === 2) {
+    if (isSubquery(b)) return {column: a, op: 'in', query: b._subquery()};
     if (Array.isArray(b)) return {column: a, op: 'in', value: b};
     if (b === null || b === undefined) return {column: a, op: 'is', value: null};
     return {column: a, op: 'eq', value: plain(b)};
   }
   const raw = String(b).trim().toLowerCase();
+  // A query as the value: `where('author_id', 'in', db.from('profiles').select('id').where(…))`.
+  if (isSubquery(c)) {
+    if (raw === 'in' || raw === '=' || raw === 'eq') return {column: a, op: 'in', query: c._subquery()};
+    if (raw === 'not in' || raw === '!=' || raw === '<>' || raw === 'neq') return {not: {column: a, op: 'in', query: c._subquery()}};
+    throw new TypeError(`a query as the value works with in and not in, not ${b}`);
+  }
   if (NEGATED[raw]) return {not: {column: a, op: NEGATED[raw], value: c === null ? null : plain(c)}};
   const fts = raw.match(/^(fts|plfts|phfts|wfts)\(([a-z_]+)\)$/);
   const op = fts ? raw : OPERATORS[raw];
@@ -147,6 +154,7 @@ export function condition(args, ctx) {
 }
 
 const plain = (v) => (v instanceof Date ? v.toISOString() : v);
+const isSubquery = (v) => v !== null && typeof v === 'object' && typeof v._subquery === 'function';
 
 /** Combines terms as SQL does: AND binds tighter than OR. */
 function combine(terms) {
@@ -262,12 +270,68 @@ class Embed extends Conditions {
     if (opts?.head) q = q._with({head: true});
     return q;
   }
-  order(...args) { return this._with({order: [...(this._s.order || []), orderTerm(args)]}); }
+  /**
+   * ORDER BY. A dotted column (`'profiles.username'`) or `{relation}` sorts
+   * by a column of a to-one related row; `{referencedTable}` (or
+   * `{foreignTable}`) sorts the rows of that embed instead.
+   */
+  order(...args) {
+    const target = embedTarget(args[1]) ?? embedTarget(args[2]);
+    const term = orderTerm(args, this._ctx);
+    if (target) return this._onEmbed(target, (e) => (e.__m2m
+      ? {...e, __m2m: {...e.__m2m, order: [...(e.__m2m.order || []), term]}}
+      : {...e, order: [...(e.order || []), term]}));
+    return this._with({order: [...(this._s.order || []), term]});
+  }
   orderBy(...args) { return this.order(...args); }
-  limit(n) { return this._with({limit: n}); }
-  offset(n) { return this._with({offset: n}); }
-  preload(relation, callback) { return this._with({embeds: [...(this._s.embeds || []), this._ctx.embed(relation, callback, false)]}); }
-  joins(relation, callback) { return this._with({embeds: [...(this._s.embeds || []), this._ctx.embed(relation, callback, true)]}); }
+  /** Newest first: ORDER BY created_at (or `column`) DESC. */
+  latest(column = 'created_at') { return this.order(column, 'desc'); }
+  /** Oldest first. */
+  oldest(column = 'created_at') { return this.order(column, 'asc'); }
+  /** LIMIT; with `{referencedTable}`, the most rows of that embed per parent row. */
+  limit(n, options) {
+    const target = embedTarget(options);
+    if (target) return this._onEmbed(target, (e) => ({...e, limit: n}));
+    return this._with({limit: n});
+  }
+  /** OFFSET; with `{referencedTable}`, for that embed's rows. */
+  offset(n, options) {
+    const target = embedTarget(options);
+    if (target) return this._onEmbed(target, (e) => ({...e, offset: n}));
+    return this._with({offset: n});
+  }
+  /**
+   * Related rows, as a LEFT JOIN: `preload('author')`, or a path,
+   * `preload('comments.author')` (GORM's `Preload("Comments.Author")`); the
+   * callback refines the last relation on the path.
+   */
+  preload(relation, callback) { return this._addEmbed(relation, callback, false); }
+  /** Related rows as an INNER JOIN: only parents with a matching related row. Paths work as in preload. */
+  joins(relation, callback) { return this._addEmbed(relation, callback, true); }
+
+  _addEmbed(path, callback, inner) {
+    const embeds = this._s.embeds || [];
+    const [head, rest] = splitPath(path, this._ctx);
+    if (!rest) return this._with({embeds: [...embeds, this._ctx.embed(head, callback, inner)]});
+    const built = this._ctx.embed(head, (q) => q._addEmbed(rest, callback, inner), inner);
+    const name = this._ctx.relation(head).name;
+    const at = embeds.findIndex((e) => embedName(e) === name);
+    if (at < 0) return this._with({embeds: [...embeds, built]});
+    // Merge into the embed already there, keeping its own filters and order.
+    const nested = relatedItems(built);
+    const next = [...embeds];
+    next[at] = withRelated(embeds[at], nested);
+    return this._with({embeds: next});
+  }
+
+  _onEmbed(name, change) {
+    const embeds = this._s.embeds || [];
+    const at = embeds.findIndex((e) => embedName(e) === name || e.embed === name);
+    if (at < 0) throw new TypeError(`${name} is not among the related rows of this query: select or preload it before ordering or limiting it`);
+    const next = [...embeds];
+    next[at] = change(embeds[at]);
+    return this._with({embeds: next});
+  }
   withCount(relation, callback, as) { return this._with({embeds: [...(this._s.embeds || []), this._ctx.aggregateEmbed(relation, callback, {count: true}, as, true)]}); }
   withAggregate(relation, spec, callback, as) { return this._with({embeds: [...(this._s.embeds || []), this._ctx.aggregateEmbed(relation, callback, spec, as, false)]}); }
 }
@@ -290,22 +354,66 @@ function selectItems(columns) {
   return out;
 }
 
-function orderTerm(args) {
+const embedTarget = (o) => (o && typeof o === 'object' && !Array.isArray(o) ? o.referencedTable || o.foreignTable || undefined : undefined);
+
+// The name an embed's rows arrive under (a many-to-many keeps its own).
+const embedName = (e) => (e.__m2m ? e.__m2m.as : e.as || e.embed || e.aggregate);
+
+// The related-row items inside a compiled embed (where a nested path lands).
+function relatedItems(embed) {
+  const target = embed.__m2m ? embed.select?.[0] : embed;
+  return (target?.select || []).filter((x) => x && typeof x === 'object' && (x.embed || x.aggregate));
+}
+
+function withRelated(embed, nested) {
+  if (embed.__m2m) {
+    const [link, ...others] = embed.select;
+    return {...embed, select: [withRelated(link, nested), ...others]};
+  }
+  return {...embed, select: embed.select?.length ? [...embed.select, ...nested] : ['*', ...nested]};
+}
+
+// `comments.author` is a path of relations; a registered model's own
+// (schema-qualified) table name is not.
+function splitPath(path, ctx) {
+  const name = String(path);
+  const dot = name.indexOf('.');
+  if (dot < 0 || name.startsWith('public.') || ctx.isModel?.(name)) return [name, null];
+  return [name.slice(0, dot), name.slice(dot + 1)];
+}
+
+// `profiles.username` (or `{relation: 'profiles'}`): a column of a to-one
+// related row. The relation is a model relation name or a table name.
+function relatedOrder(term, relation, ctx, explicitHint) {
+  const rel = ctx?.relation ? ctx.relation(relation) : {table: relation};
+  const hint = explicitHint ?? rel.constraint;
+  return {column: term.column, relation: rel.table, ...(hint ? {hint} : {}), dir: term.dir, ...(term.nulls ? {nulls: term.nulls} : {})};
+}
+
+function orderTerm(args, ctx) {
   const [a, b, c] = args;
   if (a && typeof a === 'object') return a;
+  let term;
+  let opts = {};
   if (b && typeof b === 'object') {
-    const term = {column: a, dir: b.ascending === false ? 'desc' : 'asc'};
+    opts = b;
+    term = {column: a, dir: b.ascending === false ? 'desc' : 'asc'};
     if (b.nullsFirst === true) term.nulls = 'first';
     if (b.nullsFirst === false) term.nulls = 'last';
-    return term;
+  } else {
+    const [column, dir = 'asc'] = b === undefined ? String(a).trim().split(/\s+/) : [a, b];
+    const m = column.match(/^(count|sum|avg|min|max)\((\*|[A-Za-z_][A-Za-z0-9_]*)?\)$/i);
+    const d = String(dir).toLowerCase();
+    if (d !== 'asc' && d !== 'desc') throw new TypeError(`order direction is asc or desc, not ${dir}`);
+    term = m ? {fn: m[1].toLowerCase(), ...(m[2] && m[2] !== '*' ? {column: m[2]} : {}), dir: d} : {column, dir: d};
+    const nulls = (c?.nulls || (typeof c === 'string' ? c : '') || '').toString().toLowerCase();
+    if (nulls === 'first' || nulls === 'last') term.nulls = nulls;
+    if (c && typeof c === 'object') opts = c;
   }
-  const [column, dir = 'asc'] = b === undefined ? String(a).trim().split(/\s+/) : [a, b];
-  const m = column.match(/^(count|sum|avg|min|max)\((\*|[A-Za-z_][A-Za-z0-9_]*)?\)$/i);
-  const d = String(dir).toLowerCase();
-  if (d !== 'asc' && d !== 'desc') throw new TypeError(`order direction is asc or desc, not ${dir}`);
-  const term = m ? {fn: m[1].toLowerCase(), ...(m[2] && m[2] !== '*' ? {column: m[2]} : {}), dir: d} : {column, dir: d};
-  const nulls = (c?.nulls || c || '').toString().toLowerCase();
-  if (nulls === 'first' || nulls === 'last') term.nulls = nulls;
+  if (embedTarget(opts) || term.fn) return term;
+  if (opts.relation) return relatedOrder(term, opts.relation, ctx, opts.hint);
+  const dot = typeof term.column === 'string' ? term.column.lastIndexOf('.') : -1;
+  if (dot > 0) return relatedOrder({...term, column: term.column.slice(dot + 1)}, term.column.slice(0, dot), ctx, opts.hint);
   return term;
 }
 
@@ -328,8 +436,6 @@ export class QueryBuilder extends Embed {
   maybeSingle() { return this._with({single: 'maybe'}); }
   /** Supabase's `.select()` after a write asks for the rows back, which is the default here. */
   returning(mode) { return this._with({returning: mode}); }
-  latest(column = 'created_at') { return this.order(column, 'desc'); }
-  oldest(column = 'created_at') { return this.order(column, 'asc'); }
 
   /** Row locks, for a select inside a transaction. */
   lock(strength = 'update', wait) { return this._with({lock: {strength, ...(wait ? {wait} : {})}}); }
@@ -402,13 +508,30 @@ export class QueryBuilder extends Embed {
     });
   }
 
+  /**
+   * This query as a subquery for `whereIn(column, query)`: one column (the
+   * selected one, or the primary key) of the rows its filters match.
+   */
+  _subquery() {
+    const columns = (this._s.select || []).filter((c) => c !== '*');
+    if (columns.length > 1 || (this._s.embeds || []).length) throw new TypeError('a subquery selects exactly one column: db.from(t).select(\'id\').where(…)');
+    const column = columns.length ? (typeof columns[0] === 'string' ? columns[0] : columns[0].column) : this._ctx.primaryKey;
+    return clean({from: this.table, select: column, where: this._where()});
+  }
+
+  /** Cancels the request when `signal` aborts (an AbortController's signal). */
+  abortSignal(signal) { return this._with({signal}); }
+  _opts() { return this._s.signal ? {signal: this._s.signal} : undefined; }
+
   // ── reading ────────────────────────────────────────────────────────────
 
   // Awaiting a builder runs it: the write it describes, or a read. Rows come
   // back as resultOf (an array with data and count); single()/maybeSingle() as {data}.
-  then(resolve, reject) { return this._execute().then(resolve, reject); }
-  catch(reject) { return this._execute().catch(reject); }
-  finally(fn) { return this._execute().finally(fn); }
+  // With createClient(…, {throwOnError: false}) a failure resolves as
+  // {data: null, count: null, error} instead of rejecting.
+  then(resolve, reject) { return settle(this._execute(), this._ctx).then(resolve, reject); }
+  catch(reject) { return this.then(undefined, reject); }
+  finally(fn) { return settle(this._execute(), this._ctx).finally(fn); }
 
   _execute() {
     if (!this._run) this._run = this._s.write ? this._runWrite() : this._runRead();
@@ -423,7 +546,7 @@ export class QueryBuilder extends Embed {
       if (s.single) return single(rows, s.single, this.table, count);
       if (s.head) return {data: null, count: count ?? null, error: null};
       return resultOf(rows, count);
-    }, 'rows');
+    }, 'rows', this._opts());
   }
 
   _runWrite() {
@@ -439,7 +562,7 @@ export class QueryBuilder extends Embed {
   /** Rows (all matching, up to the limit; at most 1,000 per call). Pass ids to look them up by primary key. */
   find(ids) {
     const q = ids === undefined ? this : this.whereIn(this._ctx.primaryKey, [].concat(ids));
-    return this._ctx.send(() => q.toQuery(), async ({data, count}) => resultOf(await this._ctx.afterFind(this._ctx.shape(data, q._s.embeds)), count), 'rows');
+    return this._ctx.send(() => q.toQuery(), async ({data, count}) => resultOf(await this._ctx.afterFind(this._ctx.shape(data, q._s.embeds)), count), 'rows', this._opts());
   }
   get(...ids) { return ids.length ? this.find(ids.flat()) : this.find(); }
 
@@ -483,7 +606,7 @@ export class QueryBuilder extends Embed {
   }
 
   async count() {
-    const {data} = await this._ctx.run(clean({op: 'aggregate', from: this.table, where: this._where(), count: true}));
+    const {data} = await this._ctx.run(clean({op: 'aggregate', from: this.table, where: this._where(), count: true}), this._opts());
     return Number(data.count);
   }
   async exists() { return (await this.limit(1)._with({select: [this._ctx.primaryKey], embeds: []}).find()).length > 0; }
@@ -502,20 +625,20 @@ export class QueryBuilder extends Embed {
       const {data} = await this._ctx.run(clean({
         op: 'aggregate', from: this.table, where: this._where(), group_by: this._s.groupBy,
         having, order: this._s.order, limit: this._s.limit, ...aggSpec(spec)
-      }));
+      }), this._opts());
       return data;
     }
     return this._aggregate(spec);
   }
   async _aggregate(spec) {
-    const {data} = await this._ctx.run(clean({op: 'aggregate', from: this.table, where: this._where(), ...aggSpec(spec)}));
+    const {data} = await this._ctx.run(clean({op: 'aggregate', from: this.table, where: this._where(), ...aggSpec(spec)}), this._opts());
     return data;
   }
 
   /** `{data, total, page, perPage, totalPages}` for page `page` of `perPage` rows. */
   async paginate({page = 1, perPage = 20} = {}) {
     const q = this.page(page, perPage);
-    const {data, count} = await this._ctx.run(q.toQuery({count: true}));
+    const {data, count} = await this._ctx.run(q.toQuery({count: true}), this._opts());
     const total = Number(count ?? 0);
     return {
       data: await this._ctx.afterFind(this._ctx.shape(data, q._s.embeds)),
@@ -589,7 +712,8 @@ export class QueryBuilder extends Embed {
         await this._ctx.afterWrite('Create', data);
         return many ? data : data[0];
       },
-      many || options.__rows ? 'rows' : 'row'
+      many || options.__rows ? 'rows' : 'row',
+      this._opts()
     );
   }
   /** GORM's CreateInBatches: `size` rows per request. */
@@ -627,7 +751,8 @@ export class QueryBuilder extends Embed {
         await this._ctx.afterWrite('Save', data);
         return resultOf(data, count);
       },
-      'rows'
+      'rows',
+      this._opts()
     );
   }
   /** GORM's Save: inserts a row without its primary key, otherwise updates every column it carries. */
@@ -713,7 +838,8 @@ export class QueryBuilder extends Embed {
         await this._ctx.afterWrite(hook, data);
         return resultOf(data, count);
       },
-      'rows'
+      'rows',
+      this._opts()
     );
   }
 
@@ -731,6 +857,91 @@ export class QueryBuilder extends Embed {
     const rows = await this.where(attributes)._update(values);
     return rows[0] ?? this.create({...attributes, ...values});
   }
+}
+
+/**
+ * A database function call: awaitable as it is (`{data, count, error}`), and
+ * for a function that returns rows (`SETOF <table>` or `RETURNS TABLE`),
+ * chainable like a query — select (with embeds through the table's foreign
+ * keys), filters, order, limit, range, single, maybeSingle and a count.
+ *
+ *   const {data, count} = await db.rpc('search_posts', {q: 'postgres'}, {count: 'exact'})
+ *     .select('id, title, author:profiles(username)')
+ *     .eq('published', true)
+ *     .order('created_at', {ascending: false})
+ *     .range(0, 9);
+ */
+export class RpcBuilder extends Embed {
+  get fn() { return this._ctx.fn; }
+
+  /** Rows `from` to `to`, inclusive and zero-based. */
+  range(from, to, options) {
+    const target = embedTarget(options);
+    if (target) return this._onEmbed(target, (e) => ({...e, offset: from, limit: to - from + 1}));
+    return this._with({offset: from, limit: to - from + 1});
+  }
+  /** Exactly one row as `{data}`; an error when there are none or several. */
+  single() { return this._with({single: 'one'}); }
+  /** One row or `{data: null}`; an error when there are several. */
+  maybeSingle() { return this._with({single: 'maybe'}); }
+  /** Cancels the request when `signal` aborts. */
+  abortSignal(signal) { return this._with({signal}); }
+  _opts() { return this._s.signal ? {signal: this._s.signal} : undefined; }
+
+  /** The structured call this builder describes (`POST /query/v1`). */
+  toQuery(extra = {}) {
+    const s = this._s;
+    const select = [...(s.select || []), ...(s.embeds || [])];
+    return clean({
+      op: 'rpc',
+      function: this.fn,
+      args: this._ctx.args,
+      select: select.length ? (s.select?.length ? select : ['*', ...select]) : undefined,
+      where: this.node() ?? undefined,
+      order: s.order,
+      limit: s.limit,
+      offset: s.offset,
+      count: s.count ? true : undefined,
+      ...extra
+    });
+  }
+
+  // Nothing chained: the plain call, exactly as before.
+  _plain() {
+    const s = this._s;
+    return !(s.select?.length || s.embeds?.length || this.node() || s.order?.length || s.limit !== undefined || s.offset !== undefined || s.count);
+  }
+
+  _execute() {
+    if (this._run) return this._run;
+    const s = this._s;
+    const finish = (data, count) => {
+      if (s.single) {
+        if (!Array.isArray(data)) return {data, count: count ?? null, error: null};
+        return single(data, s.single, this.fn, count);
+      }
+      if (s.head) return {data: null, count: count ?? null, error: null};
+      return {data, count: count ?? null, error: null};
+    };
+    if (this._plain()) {
+      this._run = this._ctx.rpcPlain(this.fn, this._ctx.args, this._opts()).then((r) => finish(r?.data, r?.count));
+    } else {
+      const q = s.single && s.limit === undefined ? this._with({limit: 2}) : this;
+      this._run = this._ctx.run(q.toQuery(), this._opts())
+        .then(({data, count}) => finish(Array.isArray(data) ? this._ctx.shape(data, s.embeds) : data, count));
+    }
+    return this._run;
+  }
+
+  then(resolve, reject) { return settle(this._execute(), this._ctx).then(resolve, reject); }
+  catch(reject) { return this.then(undefined, reject); }
+  finally(fn) { return settle(this._execute(), this._ctx).finally(fn); }
+}
+
+// throwOnError: false turns a rejection into {data: null, count: null, error}.
+export function settle(promise, ctx) {
+  if (ctx?.throwOnError !== false) return promise;
+  return promise.catch((error) => ({data: null, count: null, error}));
 }
 
 function single(rows, mode, table, count) {

@@ -87,9 +87,11 @@ export function tableContext(client, table, model = {}) {
     // Inside a transaction every write is recorded at once, in call order.
     deferred: client._deferred === true,
     model,
-    run: (op) => client._query(stripPrivate(op)),
-    send: (build, finish, shape) => client._send(async () => stripPrivate(await build()), finish, shape),
+    run: (op, opts) => client._query(stripPrivate(op), opts),
+    send: (build, finish, shape, opts) => client._send(async () => stripPrivate(await build()), finish, shape, opts),
     relation,
+    isModel: (name) => Boolean(client._model(name)),
+    throwOnError: client._throwOnError !== false,
 
     embed(name, callback, inner, as) {
       const rel = relation(name);
