@@ -20,7 +20,9 @@
   },
   "scripts": {
     "test": "node --test",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack --dry-run",
+    "docs": "typedoc",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "files": [
     "index.d.ts",
@@ -54,5 +56,10 @@
     "react",
     "react-native",
     "vue"
-  ]
+  ],
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typedoc": "0.28.20",
+    "typescript": "6.0.3"
+  }
 }
