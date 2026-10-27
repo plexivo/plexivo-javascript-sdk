@@ -26,7 +26,9 @@ and in a real browser.
 - **`abortSignal(signal)`** on queries and function calls; a cancelled request
   fails with code `aborted`. A request with no answer is now a `PlexivoError`
   coded `network_error` (the original error is `cause`). `error.retryAfter`
-  carries a 429's `Retry-After`.
+  carries a 429's `Retry-After`. A request refused with
+  `invalid_access_token` because a refresh rotated the session while it was
+  in flight is sent once more with the new token.
 - **User metadata**: `signUp({email, password, data})` (or Supabase's
   `options.data`), `auth.updateUser({data})` (keys merge; `null` removes),
   and `user.user_metadata`.

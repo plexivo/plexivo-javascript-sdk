@@ -114,6 +114,12 @@ export function createClient(apiUrl, publishableKey, options = {}) {
         await refreshExpiredSession();
         return call(path, init, authenticated, false);
       }
+      // The session moved on while this request was in flight (a refresh
+      // rotated it): send it once more with the new token.
+      if (sendToken && allowRefresh && response.status === 401 && payload?.error?.code === 'invalid_access_token') {
+        if (refreshPromise) await refreshPromise.catch(() => {});
+        if (session?.access_token && session.access_token !== sendToken) return call(path, init, authenticated, false);
+      }
       throw apiError(response, payload, lastTraceId);
     }
     return payload;

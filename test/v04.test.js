@@ -354,3 +354,27 @@ test('realtime: a refreshed session moves the channel to the new token', async (
   assert.equal(sockets[1].url.searchParams.get('access_token'), fresh);
   ch.unsubscribe();
 });
+
+test('a request whose session was rotated by a refresh in flight is sent again with the new token', async () => {
+  let queries = 0;
+  let db;
+  const fetch = async (url, init) => {
+    const auth = new Headers(init.headers).get('authorization');
+    if (String(url).endsWith('/auth/refresh')) return new Response(JSON.stringify({access_token: 'new', refresh_token: 'r2', user: {id: 'u'}}), {status: 200});
+    queries++;
+    if (auth === 'Bearer old') {
+      await db.auth.refreshSession();
+      return new Response(JSON.stringify({error: {code: 'invalid_access_token'}}), {status: 401});
+    }
+    return new Response(JSON.stringify({data: [{id: 1}]}), {status: 200});
+  };
+  db = createClient('https://api.example/client/v1/demo', 'plx_publishable_test', {fetch, persistSession: false, initialSession: {access_token: 'old', refresh_token: 'r1'}});
+  const rows = await db.from('posts');
+  assert.equal(rows.length, 1);
+  assert.equal(queries, 2);
+
+  // A token that is simply invalid is not retried.
+  const {db: plain, sent} = harness(() => new Response(JSON.stringify({error: {code: 'invalid_access_token'}}), {status: 401}), {initialSession: {access_token: 'bad'}});
+  await assert.rejects(plain.from('posts'), (e) => e.code === 'invalid_access_token');
+  assert.equal(sent.length, 1);
+});
