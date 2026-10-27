@@ -286,3 +286,48 @@ test('storage upload uses auth only to mint a short-lived URL and never sends pr
   assert.equal(calls[1].init.headers.get('authorization'), 'Bearer access');
   assert.equal(client.lastTraceId, 'trace-upload');
 });
+
+test('a non-JSON error page still fails as a PlexivoError with its status', async () => {
+  const {PlexivoError} = await import('../src/index.js');
+  const client = createClient('https://api.example/client/v1/demo', 'plx_publishable_test', {
+    fetch: async () => new Response('<html>Bad gateway</html>', {status: 502, headers: {'content-type': 'text/html', 'x-trace-id': 'trace-502'}})
+  });
+  await assert.rejects(client.from('notes').select(), (error) => {
+    assert.ok(error instanceof PlexivoError);
+    assert.equal(error.status, 502);
+    assert.equal(error.traceId, 'trace-502');
+    return true;
+  });
+});
+
+test('signed storage transfers fail as PlexivoError', async () => {
+  const {PlexivoError} = await import('../src/index.js');
+  const fetch = async (url) => {
+    if (url.endsWith('/auth/login')) return new Response(JSON.stringify({access_token: 'a', refresh_token: 'r'}));
+    if (url.endsWith('/sign-download')) return new Response(JSON.stringify({data: {signed_url: 'https://files.example/o/1?sig=x'}}));
+    return new Response(JSON.stringify({error: {code: 'signature_expired', message: 'expired'}}), {status: 403});
+  };
+  const client = createClient('https://api.example/client/v1/demo', 'plx_publishable_test', {fetch, persistSession: false});
+  await client.auth.signInWithPassword({email: 'a@example.com', password: 'long-password'});
+  await assert.rejects(client.storage.download('1'), (error) => {
+    assert.ok(error instanceof PlexivoError);
+    assert.equal(error.status, 403);
+    assert.equal(error.code, 'signature_expired');
+    return true;
+  });
+});
+
+test('single() and sole() refuse several rows with a PlexivoError', async () => {
+  const {PlexivoError} = await import('../src/index.js');
+  const client = createClient('https://api.example/client/v1/demo', 'plx_publishable_test', {
+    fetch: async () => new Response(JSON.stringify({data: [{id: 1}, {id: 2}], count: 2}))
+  });
+  for (const run of [() => client.from('notes').select().single(), () => client.from('notes').sole()]) {
+    await assert.rejects(run(), (error) => {
+      assert.ok(error instanceof PlexivoError);
+      assert.equal(error.code, 'multiple_rows');
+      assert.equal(error.status, 406);
+      return true;
+    });
+  }
+});

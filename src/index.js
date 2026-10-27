@@ -82,7 +82,7 @@ export function createClient(apiUrl, publishableKey, options = {}) {
 
     const response = await request(`${baseUrl}${path}`, {...init, headers});
     lastTraceId = response.headers.get('x-trace-id');
-    const payload = response.status === 204 ? null : await response.json();
+    const payload = response.status === 204 ? null : await readJson(response);
     if (!response.ok) {
       if (
         sendToken &&
@@ -244,11 +244,7 @@ export function createClient(apiUrl, publishableKey, options = {}) {
     if (!response.ok) {
       let payload;
       try { payload = await response.json(); } catch { payload = null; }
-      const error = new Error(payload?.error?.code || `HTTP ${response.status}`);
-      error.status = response.status;
-      error.code = payload?.error?.code;
-      error.traceId = payload?.trace_id || lastTraceId;
-      throw error;
+      throw apiError(response, payload, lastTraceId);
     }
     return response;
   }
@@ -642,6 +638,20 @@ export function createClient(apiUrl, publishableKey, options = {}) {
     get lastTraceId() { return lastTraceId; }
   };
   return client;
+}
+
+// A JSON body, or null when there is none or it is not JSON (a proxy's HTML
+// error page, say): a failure must still surface as a PlexivoError with its
+// status, not as a SyntaxError from the parser.
+async function readJson(response) {
+  const text = await response.text();
+  if (text === '') return null;
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    if (!response.ok) return null;
+    throw new PlexivoError('The Data API returned a response that is not JSON', {status: response.status, code: 'invalid_response'});
+  }
 }
 
 // PKCE (RFC 7636): a random verifier and its S256 challenge.

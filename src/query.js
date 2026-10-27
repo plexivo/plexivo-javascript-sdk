@@ -472,7 +472,7 @@ export class QueryBuilder extends Embed {
   async sole() {
     const rows = await this.limit(2).find();
     if (rows.length === 0) throw new RecordNotFoundError(this.table);
-    if (rows.length > 1) throw Object.assign(new Error(`more than one row in ${this.table}`), {code: 'multiple_rows'});
+    if (rows.length > 1) throw new PlexivoError(`more than one row in ${this.table}`, {status: 406, code: 'multiple_rows'});
     return rows[0];
   }
 
@@ -734,7 +734,7 @@ export class QueryBuilder extends Embed {
 }
 
 function single(rows, mode, table, count) {
-  if (rows.length > 1) throw Object.assign(new Error(`more than one row in ${table}`), {code: 'multiple_rows', status: 406});
+  if (rows.length > 1) throw new PlexivoError(`more than one row in ${table}`, {status: 406, code: 'multiple_rows'});
   if (rows.length === 0 && mode === 'one') throw new RecordNotFoundError(table);
   return {data: rows[0] ?? null, count: count ?? rows.length, error: null};
 }
